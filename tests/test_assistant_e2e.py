@@ -48,12 +48,25 @@ class TestAssistantEndToEnd(unittest.TestCase):
             loop.run_until_complete(assistant._handle_turn(dummy_pcm))
 
             # Verify dialog history in SQLite
-            recent = assistant.memory.get_recent_turns(limit=2)
+            recent = assistant.memory.get_recent_turns(limit=2, session_id=assistant.current_episode_id)
             self.assertEqual(len(recent), 2)
             self.assertEqual(recent[0]["role"], "user")
             self.assertEqual(recent[0]["content"], "What is your name?")
             self.assertEqual(recent[1]["role"], "assistant")
             self.assertIn("functioning normally", recent[1]["content"])
+
+            # Verify turn telemetry row was written
+            import sqlite3
+            with sqlite3.connect(real_store.sqlite_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT stt_ms, retrieval_ms, llm_ms, tts_first_audio_ms, model_id, route FROM turn_telemetry")
+                rows = cursor.fetchall()
+                self.assertEqual(len(rows), 1)
+                row = rows[0]
+                self.assertGreaterEqual(row[0], 0.0)
+                self.assertGreaterEqual(row[1], 0.0)
+                self.assertGreaterEqual(row[2], 0.0)
+                self.assertEqual(row[5], "remote")
         finally:
             loop.close()
 

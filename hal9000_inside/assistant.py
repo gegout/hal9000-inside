@@ -31,6 +31,7 @@ from hal9000_inside.hardware import ComputeDeviceConfig, detect_system_gpus
 from hal9000_inside.llm import LLMClient, HAL9000_SYSTEM_PROMPT
 from hal9000_inside.memory import MemoryStore, MultilingualE5Embedder
 from hal9000_inside.mcp import MCPClientManager
+from hal9000_inside.cognition.interoception import InteroceptionMonitor
 from hal9000_inside.tts import HalPiperTTS
 from hal9000_inside.ui import TerminalUI
 from myna.core import AudioFormat, PcmChunk, SessionConfig, TranscriptionDone
@@ -85,6 +86,9 @@ class Hal9000Assistant:
             self.tts = HalPiperTTS(use_cuda=tts_cuda)
 
         self.vad = SimpleVAD(sample_rate=16000, frame_duration_ms=30, min_silence_duration_ms=800)
+        self.interoception = InteroceptionMonitor()
+        self.current_episode_id: Optional[str] = None
+        self.last_latency_ms: Optional[float] = None
         
         # Parakeet STT backend
         if adapter is not None:
@@ -236,19 +240,25 @@ class Hal9000Assistant:
             self.ui.restore()
 
     async def _handle_turn(self, pcm_data: bytes):
-        """Process one completed spoken turn."""
+        """Process one completed spoken turn with telemetry and honest self-state."""
         self.ui.set_state("THINKING")
         self._cancel_current = False
 
+        if not self.current_episode_id:
+            self.current_episode_id = self.memory.start_episode(topic_summary="Spoken conversation session")
+
         # 1. Transcribe with Parakeet
+        t_stt_start = time.perf_counter()
         user_text = await self._transcribe(pcm_data)
+        stt_ms = (time.perf_counter() - t_stt_start) * 1000.0
+
         if not user_text or len(user_text.strip()) < 2:
             return
 
         self.ui.show_committed_user(user_text)
 
         # 2. Record turn in dialogue history
-        turn_id = self.memory.record_turn("user", user_text)
+        user_turn_id = self.memory.record_turn("user", user_text, session_id=self.current_episode_id)
 
         # Check for direct assistant commands
         lower_u = user_text.lower()
@@ -258,15 +268,31 @@ class Hal9000Assistant:
             return
 
         # 3. Retrieve relevant conversational memory context
+        t_ret_start = time.perf_counter()
         memories = self.memory.search(user_text, limit=4)
+        retrieval_ms = (time.perf_counter() - t_ret_start) * 1000.0
+
         memory_context = ""
         if memories:
             memory_context = "Relevant memories and context:\n" + "\n".join(f"- {m['text']}" for m in memories)
 
-        recent_turns = self.memory.get_recent_turns(limit=6)
+        recent_turns = self.memory.get_recent_turns(limit=6, session_id=self.current_episode_id)
 
-        # 4. Prompt OpenRouter LLM with MCP tools
-        messages = [{"role": "system", "content": HAL9000_SYSTEM_PROMPT}]
+        # Format interoceptive self-state block (<60 tokens)
+        route_name = "remote" if not self.llm.is_local else "local"
+        gpu_avail = bool(self.compute_config.enable_nvidia and self.compute_config.has_cuda)
+        self_state_block = self.interoception.format_self_state_prompt(
+            route=route_name,
+            model_id=self.llm.model,
+            connected=True,
+            gpu_available=gpu_avail,
+            recent_latency_ms=self.last_latency_ms,
+        )
+
+        # 4. Prompt OpenRouter/Local LLM with MCP tools and self-state block
+        messages = [
+            {"role": "system", "content": f"{HAL9000_SYSTEM_PROMPT}\n\n{self_state_block}"}
+        ]
         if memory_context:
             messages.append({"role": "system", "content": memory_context})
 
@@ -276,12 +302,16 @@ class Hal9000Assistant:
 
         tools = self.mcp.get_openai_tools() or None
 
+        t_llm_start = time.perf_counter()
+        tool_call_count = 0
+        llm_error_count = 0
         try:
             resp_msg = await self.llm.generate_response(messages, tools=tools, return_dict=True, max_tokens=256)
             
             # Check if LLM requested MCP tool execution
             if isinstance(resp_msg, dict) and resp_msg.get("tool_calls"):
                 tool_calls = resp_msg["tool_calls"]
+                tool_call_count = len(tool_calls)
                 messages.append(resp_msg)
                 for tc in tool_calls:
                     fn_name = tc.get("function", {}).get("name")
@@ -315,30 +345,53 @@ class Hal9000Assistant:
             else:
                 hal_reply = str(resp_msg)
         except Exception as e:
+            llm_error_count += 1
             self.ui.show_error(f"LLM Error: {e}")
             hal_reply = "I am sorry, Dave. I am experiencing a temporary communication difficulty."
+
+        llm_ms = (time.perf_counter() - t_llm_start) * 1000.0
+        self.last_latency_ms = llm_ms
 
         if self._cancel_current:
             return
 
         self.ui.show_hal_reply(hal_reply)
-        self.memory.record_turn("assistant", hal_reply)
+        asst_turn_id = self.memory.record_turn("assistant", hal_reply, session_id=self.current_episode_id)
 
         # 5. Synthesize and speak response
         self.ui.set_state("RESPONDING")
         self.audio_ctrl.notify_playback_started()
 
-        
+        t_tts_start = time.perf_counter()
+        tts_first_audio_ms = 0.0
         try:
             # Generate WAV audio with resident Piper
             loop = asyncio.get_running_loop()
             raw_pcm_22k = await loop.run_in_executor(None, self.tts.synthesize_raw_pcm, hal_reply)
+            tts_first_audio_ms = (time.perf_counter() - t_tts_start) * 1000.0
             
             if not self._cancel_current:
-                # Play audio via ALSA
+                # Play audio via ALSA / Sink
                 await loop.run_in_executor(None, self.playback.play_pcm, raw_pcm_22k)
         finally:
             self.audio_ctrl.notify_playback_stopped()
+
+        tts_total_ms = (time.perf_counter() - t_tts_start) * 1000.0
+
+        # Record telemetry in database
+        self.memory.record_turn_telemetry(
+            turn_id=asst_turn_id,
+            model_id=self.llm.model,
+            route=route_name,
+            stt_ms=stt_ms,
+            retrieval_ms=retrieval_ms,
+            llm_ms=llm_ms,
+            tts_first_audio_ms=tts_first_audio_ms,
+            tts_total_ms=tts_total_ms,
+            tool_calls=tool_call_count,
+            errors=llm_error_count,
+            interrupted=1 if self._cancel_current else 0,
+        )
 
     async def _transcribe(self, pcm_bytes: bytes) -> str:
         """Transcribe PCM bytes using ParakeetAdapter."""
