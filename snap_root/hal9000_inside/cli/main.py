@@ -1,0 +1,289 @@
+"""Main CLI entrypoint for HAL 9000 Inside.
+
+Subcommands:
+- run: start the conversational assistant (speech loop)
+- doctor: check models, devices, credentials, and dependencies
+- memory: inspect, remember, correct, forget, clear memory
+- import-key: securely import OpenRouter API key into application config
+"""
+
+import argparse
+import asyncio
+import os
+import sys
+from typing import Optional
+
+def cmd_doctor(args):
+    """Run diagnostics on models, dependencies, devices, and configuration."""
+    print("Running HAL 9000 Inside Doctor...")
+    issues = 0
+
+    # 1. OpenRouter API Key
+    from hal9000_inside.llm import LLMClient, load_openrouter_api_key
+    key = load_openrouter_api_key()
+    if key and key.startswith("sk-or-"):
+        redacted = key[:8] + "..." + key[-4:]
+        print(f"  [PASS] OpenRouter API Key configured: {redacted}")
+    else:
+        print("  [FAIL] OpenRouter API Key not found or invalid.")
+        issues += 1
+
+    # 2. HAL 9000 Voice Model Checksums
+    from hal9000_inside.tts import MODEL_PATH, CONFIG_PATH, EXPECTED_ONNX_SHA256, EXPECTED_JSON_SHA256
+    import hashlib
+    if os.path.isfile(MODEL_PATH):
+        with open(MODEL_PATH, "rb") as f:
+            h = hashlib.sha256(f.read()).hexdigest()
+        if h == EXPECTED_ONNX_SHA256:
+            print(f"  [PASS] HAL 9000 ONNX verified: {MODEL_PATH}")
+        else:
+            print(f"  [FAIL] HAL 9000 ONNX checksum mismatch: {h}")
+            issues += 1
+    else:
+        print(f"  [FAIL] HAL 9000 ONNX missing: {MODEL_PATH}")
+        issues += 1
+
+    if os.path.isfile(CONFIG_PATH):
+        with open(CONFIG_PATH, "rb") as f:
+            h = hashlib.sha256(f.read()).hexdigest()
+        if h == EXPECTED_JSON_SHA256:
+            print(f"  [PASS] HAL 9000 Config verified: {CONFIG_PATH}")
+        else:
+            print(f"  [FAIL] HAL 9000 Config checksum mismatch: {h}")
+            issues += 1
+    else:
+        print(f"  [FAIL] HAL 9000 Config missing: {CONFIG_PATH}")
+        issues += 1
+
+    # 3. Myna Parakeet Model
+    parakeet_dir = os.path.expanduser("~/.cache/myna/models/parakeet-tdt-0.6b-v3-int8")
+    parakeet_enc = os.path.join(parakeet_dir, "encoder-model.int8.onnx")
+    if os.path.isfile(parakeet_enc):
+        print(f"  [PASS] Myna Parakeet TDT 0.6B model present: {parakeet_dir}")
+    else:
+        print(f"  [FAIL] Myna Parakeet TDT 0.6B model missing at: {parakeet_dir}")
+        issues += 1
+
+    # 4. Multilingual E5 Model
+    e5_dir = os.path.expanduser("~/.cache/hal9000/models/multilingual-e5-small/onnx")
+    e5_model = os.path.join(e5_dir, "model.onnx")
+    if os.path.isfile(e5_model):
+        print(f"  [PASS] Multilingual E5 ONNX model present: {e5_dir}")
+    else:
+        print(f"  [FAIL] Multilingual E5 ONNX model missing at: {e5_dir}")
+        issues += 1
+
+    # 5. Audio Subsystem (ALSA & sound utilities)
+    from hal9000_inside.audio import list_audio_devices
+    caps, plays = list_audio_devices()
+    if caps or plays:
+        print(f"  [PASS] ALSA Audio devices detected: {len(caps)} capture, {len(plays)} playback")
+    else:
+        print("  [WARN] No ALSA capture/playback devices detected.")
+
+    # 6. Compute Hardware & GPU Acceleration
+    from hal9000_inside.hardware import detect_system_gpus
+    gpu_info = detect_system_gpus()
+    nv = gpu_info["nvidia"]
+    intel = gpu_info["intel"]
+    if nv["hardware_present"]:
+        drv = "driver ready" if nv["driver_ready"] else "driver not detected"
+        print(f"  [PASS] NVIDIA GPU detected: {nv['device_name']} ({drv})")
+    else:
+        print("  [INFO] NVIDIA GPU: None detected")
+
+    if intel["hardware_present"]:
+        dri = "render node available" if intel["dri_present"] else "no dri node"
+        print(f"  [PASS] Intel GPU detected: {intel['device_name']} ({dri})")
+    else:
+        print("  [INFO] Intel GPU: None detected")
+
+    # 7. Storage & Memory Paths
+    from hal9000_inside.memory import DEFAULT_DATA_DIR
+    print(f"  [PASS] Memory storage directory: {DEFAULT_DATA_DIR}")
+
+    if issues == 0:
+        print("\nAll core system checks passed.")
+        return 0
+    else:
+        print(f"\n{issues} check(s) failed.")
+        return 1
+
+
+def cmd_import_key(args):
+    """Securely import OpenRouter API key from stdin."""
+    print("Enter OpenRouter API key (input hidden or paste):")
+    try:
+        key = sys.stdin.readline().strip()
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        return 1
+
+    if not key.startswith("sk-or-"):
+        print("Error: Invalid key format. Expected key starting with 'sk-or-'.")
+        return 1
+
+    # Save to user snap or local directory
+    target_dir = os.environ.get("SNAP_USER_COMMON") or os.path.expanduser("~/.local/share/hal9000-inside")
+    os.makedirs(target_dir, exist_ok=True, mode=0o700)
+    config_file = os.path.join(target_dir, "openrouter.config")
+    
+    with open(config_file, "w") as f:
+        f.write(f"OPENROUTER_API_KEY={key}\n")
+    os.chmod(config_file, 0o600)
+    print(f"Successfully saved API key to {config_file}")
+    return 0
+
+
+def cmd_memory(args):
+    """Memory commands: inspect, remember, correct, forget, clear."""
+    from hal9000_inside.memory import MemoryStore
+    store = MemoryStore()
+
+    if args.action == "inspect":
+        memories = store.inspect_all()
+        if not memories:
+            print("No memories stored.")
+        for m in memories:
+            print(f"[{m['id'][:8]}] ({m['category']}) {m['text']}")
+    elif args.action == "remember":
+        if not args.text:
+            print("Error: --text required for remember.")
+            return 1
+        mid = store.remember(args.text, category=args.category or "fact")
+        print(f"Remembered [{mid[:8]}]: {args.text}")
+    elif args.action == "correct":
+        if not args.id or not args.text:
+            print("Error: --id and --text required for correct.")
+            return 1
+        store.correct(args.id, args.text)
+        print(f"Updated [{args.id[:8]}]: {args.text}")
+    elif args.action == "forget":
+        if not args.id:
+            print("Error: --id required for forget.")
+            return 1
+        store.forget(args.id)
+        print(f"Forgotten memory: {args.id}")
+    elif args.action == "clear":
+        store.clear()
+        print("All conversational memory and dialogue cleared.")
+    return 0
+
+
+def cmd_run(args):
+    """Run interactive voice assistant."""
+    import atexit
+    import termios
+    import sys
+
+    # Save terminal attributes at command start if connected to a tty
+    orig_termios = None
+    if sys.stdin.isatty():
+        try:
+            orig_termios = termios.tcgetattr(sys.stdin.fileno())
+            def _restore_term():
+                if orig_termios:
+                    try:
+                        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, orig_termios)
+                    except Exception:
+                        pass
+            atexit.register(_restore_term)
+        except Exception:
+            pass
+
+    from hal9000_inside.assistant import Hal9000Assistant
+    
+    # Resolve GPU flags
+    use_nvidia = None
+    if getattr(args, "nvidia", False):
+        use_nvidia = True
+    elif getattr(args, "no_nvidia", False):
+        use_nvidia = False
+
+    use_intel = None
+    if getattr(args, "intel", False):
+        use_intel = True
+    elif getattr(args, "no_intel", False):
+        use_intel = False
+
+    assistant = Hal9000Assistant(
+        capture_device=args.device,
+        model_override=args.model,
+        endpoint_override=getattr(args, "endpoint", None),
+        auto_mode=not args.push_to_talk,
+        use_nvidia=use_nvidia,
+        use_intel=use_intel,
+    )
+    try:
+        asyncio.run(assistant.run())
+    except KeyboardInterrupt:
+        print("\nHAL 9000 voice assistant stopped.")
+    finally:
+        if orig_termios and sys.stdin.isatty():
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, orig_termios)
+            except Exception:
+                pass
+    return 0
+
+
+def cmd_mcp(args):
+    """Run HAL 9000 Model Context Protocol (MCP) server over stdio."""
+    from hal9000_inside.mcp import run_stdio
+    run_stdio()
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="HAL 9000 Inside - Ubuntu Voice Assistant")
+    subparsers = parser.add_subparsers(dest="command", help="Subcommand to execute")
+
+    # doctor
+    subparsers.add_parser("doctor", help="Run system diagnostics")
+
+    # import-key
+    subparsers.add_parser("import-key", help="Securely import OpenRouter API key from stdin")
+
+    # mcp
+    subparsers.add_parser("mcp", help="Run Model Context Protocol (MCP) stdio server for memory & web retrieval")
+
+    # memory
+    mem_parser = subparsers.add_parser("memory", help="Manage conversational memory")
+    mem_parser.add_argument("action", choices=["inspect", "remember", "correct", "forget", "clear"])
+    mem_parser.add_argument("--id", help="Memory ID")
+    mem_parser.add_argument("--text", help="Memory content")
+    mem_parser.add_argument("--category", default="fact", help="Memory category")
+
+    # run
+    run_parser = subparsers.add_parser("run", help="Start voice assistant interactive loop")
+    run_parser.add_argument("--push-to-talk", action="store_true", help="Enable push-to-talk instead of auto conversation mode")
+    run_parser.add_argument("--device", help="ALSA capture device name (e.g. hw:CARD=Talk,DEV=0 or default)")
+    run_parser.add_argument("--model", help="OpenAI-compatible model ID override (e.g. gemma4-e4b-ov)")
+    run_parser.add_argument("--endpoint", help="OpenAI-compatible base URL override (e.g. http://127.0.0.1:8336/v3)")
+
+    # GPU options
+    nvidia_group = run_parser.add_mutually_exclusive_group()
+    nvidia_group.add_argument("--nvidia", dest="nvidia", action="store_true", default=None, help="Force enable NVIDIA GPU acceleration (CUDA/TensorRT)")
+    nvidia_group.add_argument("--no-nvidia", dest="no_nvidia", action="store_true", default=None, help="Disable NVIDIA GPU acceleration")
+
+    intel_group = run_parser.add_mutually_exclusive_group()
+    intel_group.add_argument("--intel", dest="intel", action="store_true", default=None, help="Force enable Intel GPU acceleration")
+    intel_group.add_argument("--no-intel", dest="no_intel", action="store_true", default=None, help="Disable Intel GPU acceleration")
+
+    args = parser.parse_args()
+
+    if args.command == "doctor":
+        sys.exit(cmd_doctor(args))
+    elif args.command == "import-key":
+        sys.exit(cmd_import_key(args))
+    elif args.command == "mcp":
+        sys.exit(cmd_mcp(args))
+    elif args.command == "memory":
+        sys.exit(cmd_memory(args))
+    elif args.command == "run":
+        sys.exit(cmd_run(args))
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()

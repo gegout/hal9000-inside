@@ -1,0 +1,53 @@
+name: hal9000-inside
+base: core24
+version: '0.2.0'
+summary: HAL 9000 voice assistant for Ubuntu
+description: |
+  HAL 9000 Inside is a complete Ubuntu voice assistant running local STT
+  (Myna Parakeet TDT 0.6B), conversational memory (local Qdrant and E5 embeddings),
+  OpenRouter LLM reasoning, and native HAL 9000 Piper TTS playback.
+grade: stable
+confinement: strict
+
+apps:
+  hal9000-inside:
+    command: bin/hal9000-inside
+    plugs:
+      - audio-playback
+      - audio-record
+      - network
+      - network-bind
+      - home
+      - personal-files
+    environment:
+      PYTHONPATH: $SNAP/lib/python3.12/site-packages:$SNAP/usr/lib/python3/dist-packages
+      SNAP_USER_COMMON: $SNAP_USER_COMMON
+
+plugs:
+  personal-files:
+    interface: personal-files
+    read:
+      - $HOME/.openrouter.config
+
+parts:
+  hal9000-inside:
+    plugin: python
+    source: .
+    stage-packages:
+      - alsa-utils
+      - libasound2
+    python-packages:
+      - piper-tts
+      - onnxruntime
+      - tokenizers
+      - numpy
+      - websockets
+      - sounddevice
+      - httpx
+      - pydantic
+      - qdrant-client
+  models:
+    plugin: dump
+    source: models/
+    organize:
+      hal9000: models/hal9000

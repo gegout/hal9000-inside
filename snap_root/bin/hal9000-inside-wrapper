@@ -1,0 +1,4 @@
+#!/bin/bash
+export LD_LIBRARY_PATH="$SNAP/usr/lib:$SNAP/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+export PYTHONPATH="$SNAP/lib/python3.12/site-packages:$SNAP/usr/lib/python3/dist-packages:$PYTHONPATH"
+exec "$SNAP/usr/bin/python3" -m hal9000_inside.cli.main "$@"

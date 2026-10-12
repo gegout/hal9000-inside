@@ -1,0 +1,793 @@
+"""WebSocket-over-Unix-domain-socket transport (T16 prototype).
+
+Implements the session contract from ``myna.core.transport`` over the
+direction-of-travel IE114 transport: one WebSocket connection per session,
+PCM as binary frames in, JSON transcript events as text frames out.
+
+Wire protocol (PROVISIONAL — input to the IE115 reconciliation, T18/T35):
+
+1. Client connects to the Unix socket and completes the WebSocket handshake.
+   The server immediately sends one ``session.created`` **greeting** (the
+   OpenAI-Realtime pattern: server speaks first) carrying both the served
+   ``protocol_version`` (additive, for version-aware clients) and the IE115
+   ``session`` defaults (for stock OpenAI clients, which wait for
+   ``session.created`` before sending anything — without the greeting they
+   would deadlock against the shape-sniff below).
+2. Client sends one text frame. Either:
+   - ``{"type": "capabilities.query"}`` — the server replies with one
+     ``{"type": "capabilities", "data": {...}}`` frame and closes (T24); or
+   - ``{"type": "session.start", "protocol_version": "1", "config": {...}}`` to
+     open a session, where ``config`` is the ``SessionConfig`` wire form (audio
+     format, language, prompt, ...), continuing below.
+3. Server checks the declared ``protocol_version`` (``myna.core.protocol``). If
+   it can't serve it, the server sends a terminal
+   ``transcription.error`` (code ``unsupported_protocol_version``) and closes.
+   The greeting already told the client which version the server speaks; there
+   is no per-session ack beyond it. (No ``session.updated`` on this dialect:
+   there is no mid-session reconfig.)
+4. Client streams raw PCM as binary frames, in the declared audio format.
+   (Binary frames, deliberately not IE115's base64-in-JSON.) Turn detection is
+   client-driven: there is
+   no server VAD; the client owns the boundary.)
+5. Client sends a text frame ``{"type": "session.finish"}`` when audio ends
+   (hotkey released). Closing the connection instead aborts the session.
+6. Server sends transcript events as text frames in the
+   ``{"event": ..., "data": {...}}`` shape (see ``myna.core.events``), ending
+   with exactly one terminal event, then closes the connection. Control frames
+   (``session.created``) carry a ``"type"`` key; transcript events carry an
+   ``"event"`` key — that is how the client tells them apart.
+
+Like every transport, this module must pass ``tests/test_contract.py`` with
+only the wiring swapped — the loopback transport is the reference semantics.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import dataclasses
+import json
+import logging
+import os
+import socket
+import weakref
+from collections import deque
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any, cast
+
+from websockets.asyncio.client import ClientConnection, unix_connect
+from websockets.asyncio.server import Server, ServerConnection, unix_serve
+from websockets.exceptions import ConnectionClosed
+
+from myna.core.audio import AudioFormat, PcmChunk, PcmFramer
+from myna.core.capabilities import (
+    Capabilities,
+    capabilities_from_wire,
+    capabilities_to_wire,
+)
+from myna.core.events import (
+    TranscriptionError,
+    TranscriptionEvent,
+    event_from_wire,
+    event_to_wire,
+)
+from myna.core.protocol import (
+    PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
+    is_supported,
+)
+from myna.core.session import (
+    SessionConfig,
+    session_config_from_wire,
+    session_config_to_wire,
+)
+from myna.core.transport import AudioAborted, EventSink, SttService
+from myna.core.wire_ie115 import (
+    INPUT_AUDIO_APPEND,
+    INPUT_AUDIO_COMMIT,
+    SESSION_CREATED,
+    SESSION_UPDATE,
+    SESSION_UPDATED,
+    Ie115Encoder,
+    append_to_pcm,
+    ie115_session_defaults,
+    new_event_id,
+    session_config_from_ie115,
+    session_config_to_ie115,
+)
+
+_TERMINAL = ("transcription.done", "transcription.error")
+
+# Bound on the audio backlog the server holds per connection, in bytes of
+# the adapter's PCM (~33 s at 16 kHz S16LE mono). Bounded, not unbounded, per
+# the bounded-buffer invariant: when a slow adapter falls behind on long-form
+# dictation, `put` blocks the WS reader, and backpressure propagates to the
+# client through the socket instead of growing server memory. This queue is
+# also where a future overload/lag signal (open item, Matias) would be
+# measured — design that signal against this bound.
+#
+# websockets buffers frames the reader has not taken yet, up to `max_queue`
+# frames of up to `max_size` (1 MiB) each; one keeps that in proportion.
+#
+# That backpressure is why neither end runs the websockets keepalive
+# (`ping_interval=None` on every unix_serve/unix_connect below): a pong is an
+# in-band frame, so once the reader is blocked on this queue the peer's pong
+# waits behind the buffered audio and the default 20 s timeout drops the
+# connection mid-utterance (reproduced 2026-09-03 with fast-fed long-form
+# audio at a 15 s SilenceCut arm). On a Unix socket a dead peer is an
+# immediate EOF anyway; the keepalive only exists for TCP paths.
+_INGRESS_CAPACITY_BYTES = 1 << 20
+_WS_MAX_QUEUE_FRAMES = 1
+# Queued chunks smaller than this merge, so tiny appends cannot turn the
+# byte budget into hundreds of thousands of objects.
+_COALESCE_BYTES = 3200
+
+_log = logging.getLogger(__name__)
+
+
+class _Boundary:
+    """An utterance boundary inside the ingress stream (an IE115 commit)."""
+
+
+_BOUNDARY = _Boundary()
+
+
+class _Ingress:
+    """The byte-bounded queue between a connection's frame reader and its
+    adapter. A put larger than the capacity is split into whole-frame pieces
+    that fit; at most one boundary is pending at a time.
+
+    Ending it never waits on capacity, so every exit path can end it:
+    ``close`` is the end of the client's audio (the adapter drains what was
+    accepted, then sees the end); ``abort`` gives up on the stream (queued
+    audio is discarded, a blocked ``put`` returns, later ones discard, the
+    adapter session is cancelled and ``get`` raises ``AudioAborted``).
+    """
+
+    def __init__(
+        self, audio_format: AudioFormat, capacity_bytes: int = _INGRESS_CAPACITY_BYTES
+    ) -> None:
+        # The adapter, not the framing, rejects a degenerate format.
+        self.frame_bytes = max(1, audio_format.frame_bytes)
+        if capacity_bytes < self.frame_bytes:
+            raise ValueError(f"{capacity_bytes} bytes hold no {self.frame_bytes}-byte frame")
+        self._format = audio_format
+        self._capacity = capacity_bytes
+        self._piece_bytes = capacity_bytes - capacity_bytes % self.frame_bytes
+        self._items: deque[bytes | _Boundary] = deque()
+        self._bytes = 0
+        self._boundary_pending = False
+        self._closed = False
+        self._aborted = False
+        self._session: asyncio.Future[None] | None = None
+        self._putters: list[asyncio.Future[None]] = []
+        self._getters: list[asyncio.Future[None]] = []
+
+    async def put(self, pcm: bytes) -> None:
+        """Queue whole frames of PCM, waiting for room piece by piece."""
+        for start in range(0, len(pcm), self._piece_bytes):
+            await self._put(pcm[start : start + self._piece_bytes])
+
+    async def put_boundary(self) -> None:
+        await self._put(_BOUNDARY)
+
+    @property
+    def aborted(self) -> bool:
+        return self._aborted
+
+    def serve(self, session: asyncio.Future[None]) -> None:
+        """``session`` is the adapter consuming the stream now: an abort
+        cancels it."""
+        self._session = session
+        if self._aborted:
+            session.cancel()
+
+    async def get(self) -> PcmChunk | _Boundary | None:
+        """The next chunk or boundary; ``None`` once the stream has ended."""
+        while not self._items and not (self._closed or self._aborted):
+            await self._wait(self._getters)
+        if self._aborted:
+            raise AudioAborted
+        if not self._items:
+            return None
+        item = self._items.popleft()
+        self._wake(self._putters)
+        if isinstance(item, _Boundary):
+            self._boundary_pending = False
+            return item
+        self._bytes -= len(item)
+        return PcmChunk(data=item, format=self._format)
+
+    def close(self) -> None:
+        self._closed = True
+        self._wake(self._getters)
+
+    def abort(self) -> None:
+        self._aborted = True
+        self._items.clear()
+        if self._session is not None:
+            self._session.cancel()
+        self._wake(self._putters)
+        self._wake(self._getters)
+
+    def _has_room(self, item: bytes | _Boundary) -> bool:
+        if isinstance(item, _Boundary):
+            return not self._boundary_pending
+        return self._bytes + len(item) <= self._capacity
+
+    async def _put(self, item: bytes | _Boundary) -> None:
+        while not self._aborted and not self._has_room(item):
+            await self._wait(self._putters)
+        if self._aborted:
+            return
+        if isinstance(item, _Boundary):
+            self._boundary_pending = True
+            self._items.append(item)
+        else:
+            self._bytes += len(item)
+            tail = self._items[-1] if self._items else None
+            if isinstance(tail, bytes) and len(tail) + len(item) <= _COALESCE_BYTES:
+                self._items[-1] = tail + item
+            else:
+                self._items.append(item)
+        self._wake(self._getters)
+
+    @staticmethod
+    async def _wait(waiters: list[asyncio.Future[None]]) -> None:
+        waiter = asyncio.get_running_loop().create_future()
+        waiters.append(waiter)
+        try:
+            await waiter
+        finally:
+            waiters.remove(waiter)
+
+    @staticmethod
+    def _wake(waiters: list[asyncio.Future[None]]) -> None:
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+
+_SD_LISTEN_FDS_START = 3  # systemd passes listening sockets from fd 3 up
+
+
+def systemd_socket() -> socket.socket | None:
+    """The listening socket handed in by systemd/snapd socket activation, or
+    ``None`` if this process wasn't launched that way.
+
+    Under socket activation, systemd owns and binds the socket and passes it as
+    fd 3 (advertised via ``LISTEN_FDS``/``LISTEN_PID``); the daemon serves on it
+    instead of binding a path, so it can exit on idle and be relaunched on the
+    next connection (T28). Testable in dev with ``systemd-socket-activate``.
+    """
+    if os.environ.get("LISTEN_PID") != str(os.getpid()):
+        return None
+    try:
+        count = int(os.environ.get("LISTEN_FDS", "0"))
+    except ValueError:
+        return None
+    if count < 1:
+        return None
+    return socket.socket(
+        fileno=_SD_LISTEN_FDS_START, family=socket.AF_UNIX, type=socket.SOCK_STREAM
+    )
+
+
+@contextlib.asynccontextmanager
+async def serve_unix(
+    service: SttService,
+    socket_path: Path | str | None = None,
+    *,
+    sock: socket.socket | None = None,
+) -> AsyncIterator[Server]:
+    """Serve ``service`` on a Unix socket; one WebSocket connection per
+    session. Use as an async context manager. Either binds ``socket_path``, or
+    serves on a pre-bound ``sock`` (e.g. from ``systemd_socket()``)."""
+    handler = _SessionHandler(service)
+    # ping_interval=None and max_queue: see the note at `_INGRESS_CAPACITY_BYTES`.
+    if sock is not None:
+        cm = unix_serve(
+            handler.handle, sock=sock, ping_interval=None, max_queue=_WS_MAX_QUEUE_FRAMES
+        )
+    else:
+        cm = unix_serve(
+            handler.handle,
+            path=str(socket_path),
+            ping_interval=None,
+            max_queue=_WS_MAX_QUEUE_FRAMES,
+        )
+    async with cast(contextlib.AbstractAsyncContextManager[Server], cm) as server:
+        try:
+            yield server
+        finally:
+            handler.abort_sessions()
+
+
+async def _discard_frames(ws: ServerConnection) -> None:
+    with contextlib.suppress(ConnectionClosed):
+        async for _ in ws:
+            pass
+
+
+async def _close(ws: ServerConnection, code: int = 1000, reason: str = "") -> None:
+    """Close, reading and discarding frames through the handshake: with
+    nothing reading, a client still sending holds the transport paused and
+    the close waits out its timeout."""
+    discard = asyncio.ensure_future(_discard_frames(ws))
+    try:
+        await ws.close(code, reason)
+    finally:
+        discard.cancel()
+        await asyncio.wait({discard})
+
+
+class _SessionHandler:
+    def __init__(self, service: SttService) -> None:
+        self._service = service
+        self._ingresses: weakref.WeakSet[_Ingress] = weakref.WeakSet()
+
+    def abort_sessions(self) -> None:
+        """Server shutdown: end every session's audio now rather than after
+        a backlog nobody will hear."""
+        for ingress in self._ingresses:
+            ingress.abort()
+
+    def _open_ingress(self, audio_format: AudioFormat) -> _Ingress:
+        ingress = _Ingress(audio_format, _INGRESS_CAPACITY_BYTES)
+        self._ingresses.add(ingress)
+        return ingress
+
+    async def _end_connection(
+        self, ws: ServerConnection, ingress: _Ingress, reader: asyncio.Future[None]
+    ) -> None:
+        """The one exit of both dialects once a session has started."""
+        ingress.abort()
+        reader.cancel()
+        await asyncio.wait({reader})
+        if not reader.cancelled() and (exc := reader.exception()) is not None:
+            _log.warning("ingress reader failed", exc_info=exc)
+        await _close(ws)
+
+    async def handle(self, ws: ServerConnection) -> None:
+        """One connection. The server speaks first: one ``session.created``
+        greeting (the IE115 defaults + served ``protocol_version``) goes out on
+        connect, so a stock OpenAI client — which waits for ``session.created``
+        before sending anything — cannot deadlock against the shape-sniff.
+        The dialect is then chosen by **shape-sniffing** the client's first
+        frame (T44/T45): ``capabilities.query`` -> capabilities;
+        ``session.start`` -> internal ``myna.core`` wire; ``session.update`` ->
+        IE115 dialect. Both dialects' clients skip the greeting as a control
+        frame."""
+        caps = self._service.capabilities()
+        default_model = caps.models[0] if caps.models else None
+        # T027: advertise streaming mode on the greeting (additive; absent on
+        # adapters that don't define `streaming` → old behavior).
+        streaming = getattr(self._service, "streaming", None)
+        with contextlib.suppress(ConnectionClosed):
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": SESSION_CREATED,
+                        "event_id": new_event_id(),
+                        "protocol_version": PROTOCOL_VERSION,
+                        "session": session_config_to_ie115(
+                            ie115_session_defaults(),
+                            model=default_model,
+                            streaming=streaming,
+                        ),
+                    }
+                )
+            )
+        try:
+            opening = await ws.recv()
+        except ConnectionClosed:
+            return
+        if self._is_capabilities_query(opening):
+            wire = capabilities_to_wire(caps)
+            with contextlib.suppress(ConnectionClosed):
+                await ws.send(json.dumps({"type": "capabilities", "data": wire}))
+                await _close(ws)
+            return
+
+        update = self._parse_session_update(opening)
+        if update is not None:
+            await self._handle_ie115(ws, *update, caps=caps)
+            return
+
+        start = self._parse_start(opening)
+        if start is None:
+            await _close(ws, 1002, "expected session.start, session.update, or capabilities.query")
+            return
+        await self._handle_internal(ws, *start)
+
+    async def _handle_internal(
+        self, ws: ServerConnection, config: SessionConfig, client_version: str | None
+    ) -> None:
+        if not is_supported(client_version):
+            with contextlib.suppress(ConnectionClosed):
+                await ws.send(
+                    json.dumps(
+                        event_to_wire(
+                            TranscriptionError(
+                                code="unsupported_protocol_version",
+                                message=(
+                                    f"server speaks {sorted(SUPPORTED_PROTOCOL_VERSIONS)}, "
+                                    f"client requested {client_version!r}"
+                                ),
+                            )
+                        )
+                    )
+                )
+                await _close(ws)
+            return
+
+        async def emit(event: TranscriptionEvent) -> None:
+            with contextlib.suppress(ConnectionClosed):
+                await ws.send(json.dumps(event_to_wire(event)))
+
+        await self._pump_session(ws, config, emit=emit)
+
+    async def _handle_ie115(
+        self,
+        ws: ServerConnection,
+        config: SessionConfig,
+        requested_model: str | None,
+        *,
+        caps: Capabilities,
+    ) -> None:
+        """IE115 dialect: OpenAI-shaped frames translated via ``wire_ie115``.
+        The ``session.created`` greeting already went out in ``handle``.
+
+        The connection is **persistent** (OpenAI multi-commit shape, decided
+        2026-07-06): each ``input_audio_buffer.commit`` closes one utterance —
+        one adapter session, terminated by its ``completed`` — and the
+        connection stays open for the next. The *client* closes when it is
+        finished; the server only closes after the client does.
+
+        The wire rate is the client's (24 kHz for a stock OpenAI client); the
+        adapter's is whatever it serves. ``config`` keeps the wire rate for the
+        ``session.updated`` echo, the adapter runs on ``adapter_config``, and
+        the PCM is resampled between the two here, per utterance."""
+        encoder = Ie115Encoder()
+        served_format = caps.input_formats[0] if caps.input_formats else AudioFormat()
+        adapter_format = dataclasses.replace(
+            served_format, sample_rate_hz=served_format.sample_rate_hz
+        )
+        adapter_config = dataclasses.replace(config, audio_format=adapter_format)
+        # Here, not at module scope: the resampler is numpy, and the benchmarker
+        # zipapp imports this module on machines that have none.
+        from myna.core.resample import Resampler
+
+        resampler = Resampler(config.audio_format.sample_rate_hz, adapter_format.sample_rate_hz)
+
+        async def send_all(frames: list[dict[str, Any]]) -> None:
+            """One event's frames, in order: an item announcement rides ahead
+            of the frame that names the item."""
+            with contextlib.suppress(ConnectionClosed):
+                for frame in frames:
+                    await ws.send(json.dumps(frame))
+
+        # One model per process: a request for a model this server does not
+        # serve is REJECTED, never silently answered by a different model (a
+        # compat client asking for X must not get Y). Selecting *which* server
+        # to dial is the discovery layer's job (plan T48), not this session's.
+        if requested_model is not None and requested_model not in caps.models:
+            await send_all(
+                encoder.frames(
+                    TranscriptionError(
+                        code="model_not_available",
+                        message=(
+                            f"this server serves {list(caps.models)!r}, not {requested_model!r}"
+                        ),
+                    )
+                )
+            )
+            with contextlib.suppress(ConnectionClosed):
+                await _close(ws)
+            return
+        model = requested_model or (caps.models[0] if caps.models else None)
+
+        with contextlib.suppress(ConnectionClosed):
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": SESSION_UPDATED,
+                        "event_id": new_event_id(),
+                        "session": session_config_to_ie115(config, model=model),
+                    }
+                )
+            )
+
+        # One reader for the whole connection; boundaries mark commits in-band.
+        ingress = self._open_ingress(adapter_format)
+
+        async def read_frames() -> None:
+            """Wire frames -> adapter PCM. A frame this cannot decode (audio
+            that is not base64, say) fails the connection with an ``error``
+            and ends the audio: the adapter finishes on what it has and the
+            client sees a terminal, never a hang waiting on ``completed``.
+            The client leaving aborts: nobody is left to hear the rest."""
+            try:
+                async for frame in ws:
+                    if isinstance(frame, bytes):
+                        await ingress.put(resampler.feed(frame))
+                        continue
+                    message = json.loads(frame)
+                    mtype = message.get("type")
+                    if mtype == INPUT_AUDIO_APPEND:
+                        wire = append_to_pcm(message, config.audio_format)
+                        await ingress.put(resampler.feed(wire.data))
+                    elif mtype == INPUT_AUDIO_COMMIT:
+                        # Acknowledged here, at receipt, as OpenAI does: from
+                        # the adapter's side of the queue the ack would wait
+                        # behind every region the utterance still has to
+                        # decode (measured 6 s on a 95 s utterance).
+                        await send_all(encoder.commit_frames())
+                        await ingress.put(resampler.flush())
+                        await ingress.put_boundary()
+                    # other client frames (e.g. further session.update): ignored
+                ingress.abort()
+            except ConnectionClosed:
+                ingress.abort()
+            except Exception as exc:
+                error = TranscriptionError(
+                    code="invalid_parameter", message=f"bad client frame: {exc}"
+                )
+                await send_all(encoder.frames(error))
+            finally:
+                ingress.close()
+
+        class _Utterance:
+            """Audio of one commit cycle, tracking whether its boundary
+            (commit or end of stream) has been consumed yet, and how many
+            seconds of PCM it handed the adapter (the ``completed`` frame's
+            ``usage``)."""
+
+            def __init__(self) -> None:
+                self.ended = False
+                self.closed = False
+                self.seconds = 0.0
+                self.terminal_seen = False
+
+            async def audio(self) -> AsyncIterator[PcmChunk]:
+                while True:
+                    item = await ingress.get()
+                    if not isinstance(item, PcmChunk):
+                        self.ended = True
+                        self.closed = item is None
+                        return
+                    self.seconds += len(item.data) / adapter_format.bytes_per_second
+                    yield item
+
+            async def drain(self) -> None:
+                """Consume to the boundary if the adapter stopped pulling early
+                (e.g. rejected the format) so leftover audio of this utterance
+                is discarded, not misread as the next one."""
+                if not self.ended:
+                    with contextlib.suppress(AudioAborted):
+                        async for _ in self.audio():
+                            pass
+
+            async def emit(self, event: TranscriptionEvent) -> None:
+                if event.type in _TERMINAL:
+                    self.terminal_seen = True
+                await send_all(encoder.frames(event, audio_seconds=self.seconds))
+
+        reader = asyncio.ensure_future(read_frames())
+        try:
+            while True:
+                # Start the adapter session EAGERLY, before any audio arrives:
+                # the adapter's load-heartbeat and `ready` must flow first,
+                # because a well-behaved client gates its audio on `ready`
+                # (lifecycle §3A / T42 — waiting for audio here would deadlock
+                # against a client waiting for `ready`). A client closing
+                # between utterances cancels it.
+                utterance = _Utterance()
+                encoder.begin_utterance()  # its events name the next committed item
+                await self._run_utterance(
+                    ingress, adapter_config, utterance.audio(), utterance.emit
+                )
+                await utterance.drain()
+                if utterance.closed or ingress.aborted:
+                    break  # the audio stream ended or was given up on
+                if not utterance.terminal_seen:
+                    # Adapter broke the exactly-one-terminal contract; a compat
+                    # client is now waiting on `completed` — fail the utterance
+                    # rather than hang it.
+                    await utterance.emit(
+                        TranscriptionError(
+                            code="internal",
+                            message="adapter ended without a terminal event",
+                        )
+                    )
+        finally:
+            await self._end_connection(ws, ingress, reader)
+
+    async def _pump_session(
+        self,
+        ws: ServerConnection,
+        config: SessionConfig,
+        *,
+        emit: EventSink,
+    ) -> None:
+        """Internal-dialect session loop (one utterance per connection, server
+        closes after the terminal event): binary frames -> PCM, ``session.finish``
+        ends the audio, every other text frame is ignored; events out via
+        ``emit``. The reader runs concurrently with the adapter (commit-drain)."""
+        ingress = self._open_ingress(config.audio_format)
+        framer = PcmFramer(ingress.frame_bytes)
+
+        async def read_frames() -> None:
+            try:
+                async for frame in ws:
+                    if isinstance(frame, bytes):
+                        await ingress.put(framer.feed(frame))
+                    elif json.loads(frame).get("type") == "session.finish":
+                        framer.flush()
+                        ingress.close()
+                        await _discard_frames(ws)  # leaving before the terminal aborts
+                        break
+                ingress.abort()
+            except ConnectionClosed:
+                ingress.abort()  # client abort
+            finally:
+                ingress.close()
+
+        async def audio_iter() -> AsyncIterator[PcmChunk]:
+            while isinstance(chunk := await ingress.get(), PcmChunk):
+                yield chunk
+
+        reader = asyncio.ensure_future(read_frames())
+        try:
+            await self._run_utterance(ingress, config, audio_iter(), emit)
+        finally:
+            await self._end_connection(ws, ingress, reader)
+
+    async def _run_utterance(
+        self,
+        ingress: _Ingress,
+        config: SessionConfig,
+        audio: AsyncIterator[PcmChunk],
+        emit: EventSink,
+    ) -> None:
+        """Run one adapter session, surfacing adapter bugs as a terminal error
+        event (shared by both dialects). It runs as its own task so that an
+        abort can cancel it wherever it is, a decode included."""
+        session = asyncio.ensure_future(self._service.run_session(config, audio, emit))
+        ingress.serve(session)
+        await asyncio.wait({session})  # the handler's exit aborts, cancelling it too
+        if session.cancelled():
+            ingress.abort()  # the adapter gave up on the stream
+            return
+        # After an abort this reports to a connection already closing.
+        if (exc := session.exception()) is not None:
+            await emit(
+                TranscriptionError(code="adapter_crash", message=f"{type(exc).__name__}: {exc}")
+            )
+
+    @staticmethod
+    def _is_capabilities_query(frame: str | bytes) -> bool:
+        if isinstance(frame, bytes):
+            return False
+        try:
+            return bool(json.loads(frame).get("type") == "capabilities.query")
+        except (ValueError, TypeError, AttributeError):
+            return False
+
+    @staticmethod
+    def _parse_start(frame: str | bytes) -> tuple[SessionConfig, str | None] | None:
+        """Parse a ``session.start`` into ``(config, protocol_version)``, or
+        ``None`` if the frame isn't a session.start. ``protocol_version`` is
+        ``None`` when the client omits it (pre-versioning clients)."""
+        if isinstance(frame, bytes):
+            return None
+        try:
+            message = json.loads(frame)
+            if message.get("type") != "session.start":
+                return None
+            config = session_config_from_wire(message.get("config") or {})
+            return config, message.get("protocol_version")
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _parse_session_update(
+        frame: str | bytes,
+    ) -> tuple[SessionConfig, str | None] | None:
+        """Parse an IE115 ``session.update`` into ``(config, requested_model)``,
+        or ``None`` if the frame isn't one (the shape-sniff hook). The model is
+        kept separate from the flat config: it names *which server* should
+        answer, not how this session decodes."""
+        if isinstance(frame, bytes):
+            return None
+        try:
+            message = json.loads(frame)
+            if message.get("type") != SESSION_UPDATE:
+                return None
+            session = message.get("session") or {}
+            transcription = (((session.get("audio") or {}).get("input")) or {}).get(
+                "transcription"
+            ) or {}
+            return session_config_from_ie115(session), transcription.get("model")
+        except (ValueError, TypeError):
+            return None
+
+
+class WsUnixClient:
+    """``SttClient`` over WebSocket on a Unix socket."""
+
+    def __init__(self, socket_path: Path | str) -> None:
+        self._socket_path = str(socket_path)
+
+    async def open_session(self, config: SessionConfig) -> _WsSession:
+        ws = await unix_connect(self._socket_path, ping_interval=None)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "session.start",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "config": session_config_to_wire(config),
+                }
+            )
+        )
+        return _WsSession(ws)
+
+    async def capabilities(self) -> Capabilities:
+        ws = await unix_connect(self._socket_path, ping_interval=None)
+        try:
+            await ws.send(json.dumps({"type": "capabilities.query"}))
+            reply = json.loads(await ws.recv())
+            if reply.get("type") == SESSION_CREATED:  # the server's greeting
+                reply = json.loads(await ws.recv())
+            if reply.get("type") != "capabilities":
+                raise ValueError(f"expected capabilities reply, got {reply.get('type')!r}")
+            return capabilities_from_wire(reply.get("data") or {})
+        finally:
+            await ws.close()
+
+
+class _WsSession:
+    def __init__(self, ws: ClientConnection) -> None:
+        self._ws = ws
+        self._audio_finished = False
+        self.protocol_version: str | None = None  # set from session.created
+
+    async def send_audio(self, chunk: PcmChunk) -> None:
+        if self._audio_finished:
+            raise RuntimeError("send_audio() after finish_audio()")
+        # The server may end the session (terminal error/done) and close mid-
+        # stream; the reason arrives on the events channel. A failed send here is
+        # then expected — suppress it (as finish_audio does) so it doesn't mask
+        # the real error with a ConnectionClosed traceback from the feeder.
+        with contextlib.suppress(ConnectionClosed):
+            await self._ws.send(chunk.data)
+
+    async def finish_audio(self) -> None:
+        if not self._audio_finished:
+            self._audio_finished = True
+            with contextlib.suppress(ConnectionClosed):
+                await self._ws.send(json.dumps({"type": "session.finish"}))
+
+    async def events(self) -> AsyncIterator[TranscriptionEvent]:
+        try:
+            async for frame in self._ws:
+                if isinstance(frame, bytes):
+                    continue  # server never sends binary; tolerate it
+                message = json.loads(frame)
+                if message.get("type") == "session.created":
+                    self.protocol_version = message.get("protocol_version")
+                    continue  # the server's greeting, not a transcript event
+                if "event" not in message:
+                    continue  # other control frames: ignore
+                event = event_from_wire(message)
+                if event is None:
+                    continue  # unknown event type: additive, skip
+                yield event
+                if event.type in _TERMINAL:
+                    return
+        except ConnectionClosed:
+            return  # session ended without a terminal event (server abort)
+
+    async def aclose(self) -> None:
+        await self._ws.close()

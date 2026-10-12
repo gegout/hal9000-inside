@@ -1,0 +1,374 @@
+"""IE115 wire dialect — codec between the flat ``myna.core`` vocabulary and
+the supported OpenAI-Realtime-shaped subset.
+
+This is a *translation layer*, not a new protocol. The internal vocab
+(``myna.core.events`` / ``session``) stays the semantic core; the transport
+(``transport_ws``) picks a dialect by **shape-sniffing** the client's first
+frame (``session.update`` = IE115, ``session.start`` = internal) and routes
+encode/decode through here for IE115 connections.
+
+What the mapping does:
+
+- ``SessionConfig`` <-> nested ``session.audio.input.{format,transcription}``.
+- ``transcription.progress{phase}`` <-> additive ``STATUS{state}`` liveness event
+  (``preparing``->``loading``). We deliberately do **not** emit OpenAI's
+  ``server_error/model_loading`` — loading is a liveness property, not an error.
+- ``transcription.final`` <-> ``conversation.item.input_audio_transcription.delta``
+  — committed, append-only segment text. One ``item_id`` per utterance (we mint
+  it; dictation has no conversation graph); every delta of the utterance and its
+  ``completed`` share it, and ``conversation.item.created`` announces it before
+  any of them does, so a client that keys deltas on the item has one to key
+  them on. Timed ``segments`` ride along as an additive field
+  when the session asked for them, so a caption or subtitle client can place
+  the text in time; dictation never asks and never sees it.
+- ``transcription.done`` <-> ``conversation.item.input_audio_transcription.completed``
+  — one per ``input_audio_buffer.commit``, carrying the full utterance
+  transcript. This is the utterance terminal: **the connection stays open**
+  (OpenAI multi-commit shape, decided 2026-07-06); the *client* closes when it is
+  finished. A client therefore reads a close *before* ``completed`` as an
+  error, never a synthesised ``done`` — a dead server must not read as a
+  successful utterance.
+- ``transcription.error`` <-> ``error{error:{type,code,message}}``. The code
+  mapping is **lossy** (our richer codes collapse onto IE115's four) — that
+  lossiness is the T31 evidence, kept on purpose.
+
+Audio: ``input_audio_buffer.append`` carries base64 PCM16 in JSON; the transport
+also accepts raw WS binary frames (the frame-type hatch). Decoding the base64
+payload lives here.
+
+Conformance (``tests/test_openai_realtime_conformance.py`` holds every server
+frame to the ``openai`` SDK's models): every frame carries a unique
+``event_id``; a commit is acknowledged with ``input_audio_buffer.committed``
+naming the utterance's item; ``completed`` carries ``usage`` in the duration
+form (seconds of PCM consumed - we have no tokens to bill); the session object
+is ``type: "transcription"``.
+
+Audio rate: OpenAI's ``audio/pcm`` is 24 kHz and nothing else, so that is the
+dialect's default and what the greeting advertises. The adapters take 16 kHz;
+the transport resamples at this edge (``myna.core.resample``) and the adapter
+never learns the wire rate. Our own clients state their real capture rate
+(any rate is accepted and resampled), the one addition on the client side.
+"""
+
+from __future__ import annotations
+
+import base64
+import dataclasses
+import uuid
+from collections import deque
+from typing import Any
+
+from myna.core.audio import AudioFormat, PcmChunk
+from myna.core.events import (
+    PHASE_PREPARING,
+    PHASE_READY,
+    PHASE_TRANSCRIBING,
+    Segment,
+    TranscriptionDone,
+    TranscriptionError,
+    TranscriptionEvent,
+    TranscriptionFinal,
+    TranscriptionProgress,
+)
+from myna.core.session import SessionConfig
+
+# Additive liveness event (agreed 2026-07-01; name is provisional — note §7.5).
+STATUS_EVENT = "status"
+
+# OpenAI's one PCM rate: the dialect default when a client states no format,
+# and the greeting's advertisement. Pinned against the SDK by the conformance
+# suite.
+IE115_PCM_RATE = 24_000
+
+# IE115 frame type constants.
+SESSION_UPDATE = "session.update"
+SESSION_CREATED = "session.created"
+SESSION_UPDATED = "session.updated"
+INPUT_AUDIO_APPEND = "input_audio_buffer.append"
+INPUT_AUDIO_COMMIT = "input_audio_buffer.commit"
+INPUT_AUDIO_COMMITTED = "input_audio_buffer.committed"
+CONVERSATION_ITEM_CREATED = "conversation.item.created"
+TRANSCRIPTION_DELTA = "conversation.item.input_audio_transcription.delta"
+TRANSCRIPTION_COMPLETED = "conversation.item.input_audio_transcription.completed"
+ERROR = "error"
+
+_PHASE_TO_STATE = {
+    PHASE_PREPARING: "loading",
+    PHASE_READY: "ready",
+    PHASE_TRANSCRIBING: "transcribing",
+}
+
+# Internal error code -> (IE115 error type, IE115 error code). Intentionally
+# lossy: IE115 defines only four codes across two types and no
+# terminal/recoverable axis. Collisions here are the T31 evidence.
+_ERROR_TO_IE115 = {
+    "unsupported_audio_format": ("invalid_request_error", "invalid_parameter"),
+    "unsupported_protocol_version": ("invalid_request_error", "invalid_parameter"),
+    "language_not_supported": ("invalid_request_error", "invalid_parameter"),
+    "model_not_available": ("invalid_request_error", "invalid_parameter"),
+    "invalid_parameter": ("invalid_request_error", "invalid_parameter"),
+    "unknown_parameter": ("invalid_request_error", "unknown_parameter"),
+    "inference_failed": ("server_error", "server_error"),
+    "adapter_crash": ("server_error", "server_error"),
+    "internal": ("server_error", "server_error"),
+}
+
+
+def new_event_id() -> str:
+    """A fresh ``event_id``: OpenAI stamps one on every server event and
+    clients key logs and error attribution on it."""
+    return f"event_{uuid.uuid4().hex[:12]}"
+
+
+# --- timed segments -> additive `segments` field --------------------------------
+
+
+def segments_to_ie115(segments: tuple[Segment, ...]) -> list[dict[str, Any]]:
+    """Timed segments as wire objects. ``score`` is omitted when the adapter
+    did not supply one rather than sent as null."""
+    return [
+        {
+            "start": seg.start,
+            "end": seg.end,
+            "text": seg.text,
+            **({"score": seg.score} if seg.score is not None else {}),
+        }
+        for seg in segments
+    ]
+
+
+# --- session config <-> nested IE115 `session` object ---------------------------
+
+
+def session_config_to_ie115(
+    config: SessionConfig, *, model: str | None = None, streaming: bool | None = None
+) -> dict[str, Any]:
+    """Flat ``SessionConfig`` -> the nested IE115 ``session`` object (the body of
+    ``session.update`` / ``session.created`` / ``session.updated``)."""
+    transcription: dict[str, Any] = {}
+    if model is not None:
+        transcription["model"] = model
+    if config.language is not None:
+        transcription["language"] = config.language
+    if config.prompt is not None:
+        transcription["prompt"] = config.prompt  # note §7.3: kept here, not top-level
+    if config.timestamp_granularity is not None:
+        transcription["timestamp_granularity"] = config.timestamp_granularity
+    session: dict[str, Any] = {
+        "type": "transcription",
+        "audio": {
+            "input": {
+                "format": {
+                    "type": "audio/pcm",
+                    "rate": config.audio_format.sample_rate_hz,
+                },
+                "transcription": transcription,
+            }
+        },
+    }
+    # Add streaming field if specified (T14, feature 007)
+    if streaming is not None:
+        session["streaming"] = streaming
+    return session
+
+
+def ie115_session_defaults() -> SessionConfig:
+    """What a connection is before the client says anything: OpenAI's audio
+    (24 kHz mono 16-bit), no language, no prompt."""
+    return SessionConfig(audio_format=AudioFormat(sample_rate_hz=IE115_PCM_RATE))
+
+
+def session_config_from_ie115(session: dict[str, Any]) -> SessionConfig:
+    """Nested IE115 ``session`` object -> flat ``SessionConfig``. Channels/width
+    are not expressible in IE115's ``format`` (note §7.2) so we assume our only
+    accepted shape: mono 16-bit PCM. A missing rate is OpenAI's rate."""
+    audio_input = ((session.get("audio") or {}).get("input")) or {}
+    fmt = audio_input.get("format") or {}
+    transcription = audio_input.get("transcription") or {}
+    rate = fmt.get("rate", IE115_PCM_RATE)
+    return SessionConfig(
+        audio_format=AudioFormat(sample_rate_hz=int(rate)),
+        language=transcription.get("language"),
+        prompt=transcription.get("prompt") or session.get("prompt"),
+        timestamp_granularity=transcription.get("timestamp_granularity"),
+    )
+
+
+# --- audio append -> PcmChunk ---------------------------------------------------
+
+
+def append_to_pcm(frame: dict[str, Any], fmt: AudioFormat) -> PcmChunk:
+    """Decode an ``input_audio_buffer.append`` (base64 PCM16) into a PcmChunk."""
+    data = base64.b64decode(frame.get("audio") or "")
+    return PcmChunk(data=data, format=fmt)
+
+
+# --- event encode (server side) -------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class _Item:
+    """One conversation item: an utterance's id and the item minted before it."""
+
+    id: str
+    previous: str | None
+
+
+def _item_created(item: _Item) -> dict[str, Any]:
+    """OpenAI's ``conversation.item.created``, announcing ``item`` to the
+    client. The item holds the utterance's input audio and is ``in_progress``
+    until its ``completed`` carries the transcript."""
+    return {
+        "type": CONVERSATION_ITEM_CREATED,
+        "event_id": new_event_id(),
+        "previous_item_id": item.previous,
+        "item": {
+            "id": item.id,
+            "object": "realtime.item",
+            "type": "message",
+            "status": "in_progress",
+            "role": "user",
+            "content": [{"type": "input_audio"}],
+        },
+    }
+
+
+class Ie115Encoder:
+    """Encodes internal transcript events into IE115 server frames, holding the
+    per-utterance ``item_id`` IE115 requires (dictation has no conversation
+    graph, so we mint one per utterance): every ``delta`` of an utterance and
+    its ``completed`` share the item, and ``begin_utterance`` retires it, so
+    the next utterance on the same connection gets a fresh one.
+
+    A commit is acknowledged at receipt, so the transport's reader can be a
+    whole utterance ahead of the adapter. Items are therefore assigned in
+    commit order and queued: ``commit_frames`` mints the item its commit
+    closes, and the adapter's events take the queue in the same order, one item
+    per utterance. The transport's one-pending-commit rule bounds the queue.
+
+    **An item is announced when it is minted, never later than the first frame
+    that names it.** Both entry points therefore return a *list* of frames to
+    send in order, because minting an item emits a second frame:
+    ``conversation.item.created``. On the commit path that is OpenAI's own
+    order (``committed`` then ``created``). A streaming adapter transcribing
+    before the client commits mints the item early, so its announcement goes
+    out ahead of the delta instead - the one ordering we cannot match without
+    either holding the delta (latency) or naming an item the client has never
+    been told about (a third-party client keying deltas on the item drops
+    every pre-commit one). An item is announced exactly once: the commit that
+    closes an already-announced utterance only acknowledges it."""
+
+    def __init__(self) -> None:
+        self._queued: deque[_Item] = deque()
+        self._current: _Item | None = None
+        self._uncommitted: _Item | None = None
+        self._last_id: str | None = None
+        self._announcements: list[dict[str, Any]] = []
+
+    def _mint(self) -> _Item:
+        item = _Item(f"item_{uuid.uuid4().hex[:12]}", self._last_id)
+        self._last_id = item.id
+        self._announcements.append(_item_created(item))
+        return item
+
+    def _announced(self) -> list[dict[str, Any]]:
+        """The announcements minting has queued since the last call."""
+        pending, self._announcements = self._announcements, []
+        return pending
+
+    def _item(self) -> str:
+        """The item the adapter's events name: the oldest commit it has not
+        answered yet, or a fresh one when it is transcribing audio the client
+        has not committed (a streaming adapter emits before the boundary)."""
+        if self._current is None:
+            if self._queued:
+                self._current = self._queued.popleft()
+            else:
+                self._current = self._uncommitted = self._mint()
+        return self._current.id
+
+    def begin_utterance(self) -> None:
+        """The transport hands the next utterance to the adapter, retiring the
+        last one's item: the one it named, or - when it ended without naming
+        one, on a terminal error say - the one its own commit acknowledged,
+        which would otherwise land on this utterance."""
+        if self._current is None and self._queued:
+            self._queued.popleft()
+        self._current = None
+
+    def commit_frames(self) -> list[dict[str, Any]]:
+        """The ``input_audio_buffer.committed`` acknowledging the client's
+        commit, followed by the announcement of the item it minted: it names
+        the utterance's item, which is how a stock client joins the deltas and
+        the ``completed`` that follow. A commit closing an utterance the
+        adapter already spoke for adds no announcement - that item was
+        announced when it was minted."""
+        item = self._uncommitted
+        if item is None:
+            item = self._mint()
+            self._queued.append(item)
+        self._uncommitted = None
+        ack = {
+            "type": INPUT_AUDIO_COMMITTED,
+            "event_id": new_event_id(),
+            "item_id": item.id,
+            "previous_item_id": item.previous,
+        }
+        return [ack, *self._announced()]
+
+    def frames(
+        self, event: TranscriptionEvent, *, audio_seconds: float = 0.0
+    ) -> list[dict[str, Any]]:
+        """The IE115 frames for ``event``, in send order: the announcement of
+        any item the event minted, then the event's own frame. Every event has
+        a frame: ``done`` is the utterance's ``completed`` (the connection
+        stays open), reporting ``audio_seconds`` - the PCM the utterance
+        consumed, which only the transport knows - as its ``usage``."""
+        frame = self._encode(event, audio_seconds)
+        frame["event_id"] = new_event_id()
+        return [*self._announced(), frame]
+
+    def _encode(self, event: TranscriptionEvent, audio_seconds: float) -> dict[str, Any]:
+        if isinstance(event, TranscriptionProgress):
+            frame: dict[str, Any] = {
+                "type": STATUS_EVENT,
+                "state": _PHASE_TO_STATE.get(event.phase, "transcribing"),
+            }
+            if event.snippet:  # additive, optional (note §7.5)
+                frame["snippet"] = event.snippet
+            if event.warning:  # additive, optional (T10 memory-pressure notice)
+                frame["warning"] = event.warning
+            return frame
+        if isinstance(event, TranscriptionFinal):
+            frame = {
+                "type": TRANSCRIPTION_DELTA,
+                "item_id": self._item(),
+                "content_index": 0,
+                "delta": event.text,
+                "disposition": event.disposition.value,  # Add disposition field (T11, feature 007)
+            }
+            # Add segment_index only for committed segments (T13, feature 007)
+            if event.disposition == event.disposition.COMMITTED and event.segment_index is not None:
+                frame["segment_index"] = event.segment_index
+            if event.segments:
+                frame["segments"] = segments_to_ie115(event.segments)
+            return frame
+        if isinstance(event, TranscriptionDone):
+            item = self._item()
+            frame = {
+                "type": TRANSCRIPTION_COMPLETED,
+                "item_id": item,
+                "content_index": 0,
+                "transcript": event.text,
+                "usage": {"type": "duration", "seconds": audio_seconds},
+            }
+            if event.segments:
+                frame["segments"] = segments_to_ie115(event.segments)
+            return frame
+        if isinstance(event, TranscriptionError):
+            etype, ecode = _ERROR_TO_IE115.get(event.code, ("server_error", "server_error"))
+            return {
+                "type": ERROR,
+                "error": {"type": etype, "code": ecode, "message": event.message},
+            }
+        raise ValueError(f"cannot encode event: {event!r}")

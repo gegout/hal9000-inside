@@ -1,0 +1,365 @@
+"""Command-line entry point for the Myna server.
+
+    myna-server --socket /path/to/myna.sock --model tiny
+    python -m myna.server --socket ... --model base --preload
+
+Serves transcription sessions over WebSocket on the given Unix socket until
+SIGTERM/SIGINT. Model weights load lazily on the first session by default;
+``--preload`` loads (and warms) at startup instead, trading idle memory for
+first-session latency — the trade-off IE114 leaves to configuration.
+
+Privacy: transcription content is never logged.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import logging
+import os
+import signal
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from myna.testbed.adapter import Adapter
+
+log = logging.getLogger("myna.server")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="myna-server", description=__doc__)
+    parser.add_argument("--socket", required=True, type=Path, help="Unix socket path to serve on")
+    parser.add_argument(
+        "--adapter",
+        default="whisper",
+        choices=("whisper", "parakeet", "funasr", "fake"),
+        help="ASR backend ('fake' = scripted, no model — for wire/contract testing)",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="model id/path; default per adapter (whisper: tiny; "
+        "funasr: ONNX model dir — default: staged cache snapshot)",
+    )
+    parser.add_argument(
+        "--device",
+        default=None,
+        choices=("cpu", "cuda"),
+        help="inference device; default per adapter (whisper, parakeet: cpu)",
+    )
+    parser.add_argument(
+        "--compute-type", default="default", help="CTranslate2 compute type (whisper)"
+    )
+    parser.add_argument(
+        "--socket-mode",
+        default="0666",
+        help="octal permission bits for the socket file (default world-connectable; "
+        "tighten via dir permissions or dedicated group in production)",
+    )
+    parser.add_argument(
+        "--share-provider",
+        action="store_true",
+        help="write provider.env (SNAP_NAME, SNAP_INSTANCE_NAME, UNIX_SOCKET) beside the "
+        "socket for the inference-provider content interface; needs the snap environment",
+    )
+    parser.add_argument("--preload", action="store_true", help="load the model at startup")
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="enable streaming mode (progressive committed segments; whisper/parakeet)",
+    )
+    parser.add_argument(
+        "--stream-cadence-s",
+        type=float,
+        default=None,
+        help="seconds of new audio between re-decode ticks (whisper streaming)",
+    )
+    parser.add_argument(
+        "--stream-window-cap-s",
+        type=float,
+        default=None,
+        help="max uncommitted audio window in seconds before force-commit (whisper streaming)",
+    )
+    parser.add_argument(
+        "--stream-beam-size",
+        type=int,
+        default=None,
+        help="beam size for streaming re-decode ticks (default 1 = greedy; "
+        "5 matches batch decode quality at ~5x tick cost)",
+    )
+    parser.add_argument(
+        "--batch-condition-on-previous-text",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="chain each batch window's text into the next window's prompt "
+        "(whisper; default on - the small models measured better with it, the "
+        "large ones loop on it and their model.yaml turns it off)",
+    )
+    parser.add_argument(
+        "--batch-vad-filter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="strip silence with the bundled Silero VAD before each batch decode "
+        "(whisper; default off - costs accuracy on small models, needed by the "
+        "large ones alongside --no-batch-condition-on-previous-text)",
+    )
+    parser.add_argument(
+        "--stream-arm-s",
+        type=float,
+        default=None,
+        help="seconds of uncommitted audio before Parakeet SilenceCut can commit "
+        "(default 15; lower for earlier chunks)",
+    )
+    parser.add_argument(
+        "--stream-silence-cut-s",
+        type=float,
+        default=None,
+        help="pause duration in seconds that cuts a Parakeet streaming chunk (default 0.5)",
+    )
+    parser.add_argument(
+        "--stream-force-cut-s",
+        type=float,
+        default=None,
+        help="max uncommitted audio window before Parakeet force-commits (default 60)",
+    )
+    parser.add_argument(
+        "--stream-partial-cadence-s",
+        type=float,
+        default=None,
+        help="seconds between Parakeet unstable-partial ticks between commits "
+        "(default 2.0, perf T04; 0 shows nothing until the first cut)",
+    )
+    parser.add_argument(
+        "--stream-partial-tail-s",
+        type=float,
+        default=None,
+        help="cap each Parakeet partial tick at the last N seconds of the window "
+        "(default 0 = whole window; capping shows only those N seconds)",
+    )
+    parser.add_argument(
+        "--sleep-idle-seconds",
+        type=float,
+        default=0.0,
+        help="release the model after N idle seconds (0 = never)",
+    )
+    parser.add_argument(
+        "--idle-action",
+        default="unload",
+        choices=("unload", "exit"),
+        help="on idle: 'unload' (drop weights, keep serving) or 'exit' (for socket activation)",
+    )
+    parser.add_argument(
+        "--funasr-language",
+        default="auto",
+        choices=("auto", "zh", "en", "yue", "ja", "ko"),
+        help="language for SenseVoice decoding (default: auto)",
+    )
+    parser.add_argument(
+        "--funasr-textnorm",
+        default="withitn",
+        choices=("woitn", "withitn"),
+        help="SenseVoice decoder prompt: withitn (punctuation, casing and "
+        "digits/dates, default), woitn (spoken form, unpunctuated)",
+    )
+    return parser
+
+
+def _default_if_none(value: float | None, fallback: float) -> float:
+    """`x or fallback` is wrong wherever 0 is a meaningful setting."""
+    return fallback if value is None else value
+
+
+def build_adapter(args: argparse.Namespace) -> Adapter:
+    """Construct the chosen adapter, importing its extra lazily so --help and
+    the other adapter work without it installed."""
+    if args.adapter == "fake":
+        # No model, no extra: the permanent regression fixture, served over the
+        # wire so transport/contract clients (e.g. the Rust orchestrator) can
+        # integration-test without a GPU or model. See myna.testbed.fake.
+        from myna.testbed.fake import FakeAdapter
+
+        return FakeAdapter()
+
+    if args.adapter == "whisper":
+        from myna.testbed.whisper import (
+            STREAM_BEAM_SIZE,
+            STREAM_CADENCE_S,
+            STREAM_WINDOW_CAP_S,
+            FasterWhisperAdapter,
+        )
+
+        return FasterWhisperAdapter(
+            args.model or "tiny",
+            device=args.device or "cpu",
+            compute_type=args.compute_type,
+            streaming=args.streaming,
+            # getattr: programmatic callers (tests, embedding) may build the
+            # namespace without the streaming flags.
+            stream_cadence_s=getattr(args, "stream_cadence_s", None) or STREAM_CADENCE_S,
+            stream_window_cap_s=getattr(args, "stream_window_cap_s", None) or STREAM_WINDOW_CAP_S,
+            stream_beam_size=getattr(args, "stream_beam_size", None) or STREAM_BEAM_SIZE,
+            batch_condition_on_previous_text=getattr(
+                args, "batch_condition_on_previous_text", True
+            ),
+            batch_vad_filter=getattr(args, "batch_vad_filter", False),
+        )
+
+    if args.adapter == "parakeet":
+        from myna.testbed.parakeet import PARTIAL_CADENCE_S, PARTIAL_TAIL_S, ParakeetAdapter
+
+        return ParakeetAdapter(
+            args.model,
+            device=args.device or "cpu",
+            streaming=args.streaming,
+            stream_arm_s=getattr(args, "stream_arm_s", None) or 15.0,
+            stream_silence_cut_s=getattr(args, "stream_silence_cut_s", None) or 0.5,
+            stream_force_cut_s=getattr(args, "stream_force_cut_s", None) or 60.0,
+            # `or` would swallow an explicit 0, and 0 is how partials are
+            # turned off. Default from the adapter module (perf T04), not a
+            # literal here, so the two can't drift apart.
+            stream_partial_cadence_s=_default_if_none(
+                getattr(args, "stream_partial_cadence_s", None), PARTIAL_CADENCE_S
+            ),
+            stream_partial_tail_s=_default_if_none(
+                getattr(args, "stream_partial_tail_s", None), PARTIAL_TAIL_S
+            ),
+        )
+
+    if args.adapter == "funasr":
+        from myna.testbed.funasr import FunasrAdapter
+
+        # --model is the ONNX model dir; absent = the staged
+        # ModelScope cache snapshot (dev/fetch_funasr_model.py).
+        return FunasrAdapter(
+            args.model,
+            language=args.funasr_language,
+            textnorm=args.funasr_textnorm,
+        )
+
+    raise ValueError(f"unknown adapter: {args.adapter!r}")
+
+
+async def serve(args: argparse.Namespace) -> None:
+    # Before anything slow, so a snap missing its identity fails at once.
+    # Written from --socket under socket activation too: the path is the share.
+    if args.share_provider:
+        from myna.server import provider_env
+
+        provider_env.share(args.socket, os.environ)
+
+    # Imported here so --help works without the adapter's extra installed.
+    try:
+        adapter = build_adapter(args)
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            f"missing dependency ({exc.name}) — install myna with the '{args.adapter}' extra"
+        ) from exc
+    except ValueError as exc:
+        raise SystemExit(f"invalid --adapter {args.adapter} configuration: {exc}") from exc
+
+    from myna.core import serve_unix, systemd_socket
+    from myna.server.lifecycle import LifecycleService, idle_monitor
+
+    if args.preload:
+        load = getattr(adapter, "_load_model", None)
+        if load is None:
+            log.info("adapter=%s has nothing to preload", args.adapter)
+        else:
+            log.info("preloading adapter=%s model=%s", args.adapter, args.model or "(default)")
+            await load()
+
+    lifecycle = LifecycleService(adapter)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+
+    try:
+        monitor = None
+        if args.sleep_idle_seconds > 0:
+            monitor = asyncio.ensure_future(
+                idle_monitor(lifecycle, args.sleep_idle_seconds, args.idle_action, stop, log=log)
+            )
+
+        # Under socket activation systemd owns the socket and hands it to us; we
+        # don't bind/chmod/unlink the path (it manages those).
+        inherited = systemd_socket()
+        if inherited is None:
+            args.socket.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.suppress(FileNotFoundError):  # stale socket → bind() fails
+                args.socket.unlink()
+
+        async with serve_unix(lifecycle, args.socket, sock=inherited):
+            if inherited is None:
+                os.chmod(args.socket, int(args.socket_mode, 8))
+            log.info(
+                "serving adapter=%s candidate=%s on %s (pid %d; idle=%s/%s; activation=%s)",
+                args.adapter,
+                lifecycle.candidate.id,
+                "systemd-socket" if inherited is not None else args.socket,
+                os.getpid(),
+                args.sleep_idle_seconds or "off",
+                args.idle_action,
+                "yes" if inherited is not None else "no",
+            )
+            await stop.wait()
+
+        log.info("shutting down")
+        if monitor is not None:
+            monitor.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await monitor
+        if inherited is None:
+            with contextlib.suppress(FileNotFoundError):
+                args.socket.unlink()
+    finally:
+        # The wakeup fd asyncio installs outlives the pipe it writes to:
+        # loop.close() closes the self-pipe first and only then restores the
+        # handlers, so a second signal in that window writes to a closed fd and
+        # CPython prints an ignored EBADF. Hand the signals back here, while the
+        # pipe is still open and a late SIGTERM can just end the process.
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.remove_signal_handler(sig)
+
+
+def _validate_streaming_args(args: argparse.Namespace) -> None:
+    """Streaming tuning flags are whisper-only (contracts/strategy-config.md);
+    with --streaming off they are inert (batch degenerate) — warn, don't fail."""
+    tuning = [
+        f"--{name}"
+        for name, value in (
+            ("stream-cadence-s", args.stream_cadence_s),
+            ("stream-window-cap-s", args.stream_window_cap_s),
+            ("stream-beam-size", args.stream_beam_size),
+        )
+        if value is not None
+    ]
+    if not args.streaming:
+        if tuning:
+            log.warning("%s ignored without --streaming (batch mode)", ", ".join(tuning))
+    elif tuning and args.adapter != "whisper":
+        # Parakeet's chunked commit has its own constants (SilenceCut); the
+        # re-decode tuning flags are whisper-only (contracts/strategy-config.md).
+        log.warning(
+            "%s are whisper-only, ignored for --adapter %s",
+            ", ".join(tuning),
+            args.adapter,
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    args = build_parser().parse_args(argv)
+    _validate_streaming_args(args)
+    try:
+        asyncio.run(serve(args))
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

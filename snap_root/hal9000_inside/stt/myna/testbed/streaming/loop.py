@@ -1,0 +1,640 @@
+"""The streaming emission loop (feature 008).
+
+Drives a RollingWindow + commit strategy over a live PCM chunk stream.
+Re-decode strategies (local-agreement): the uncommitted window is re-decoded
+on a cadence and the strategy decides what to commit when. Chunked policies
+(SilenceCut, murmure-style — Parakeet TDT): the loop watches the audio for a
+silence/force cut; only then is the region up to the cut decoded *once* and
+committed wholesale — no re-decode, so committed text costs one decode per
+chunk. Between cuts, ``partial_cadence_seconds`` re-decodes the tail of the
+uncommitted window for *display* (see [`_chunked_partial`]): committed text is
+untouched by it, and without it a chunked strategy shows nothing until its
+first cut, which at the shipped 15 s arm is most of a minute in the worst
+case. A tick costs what the growing window costs, so its spacing is bounded
+by [`PARTIAL_BUDGET`] as well as by the cadence. Emits 007-contract events
+(committed finals with monotonic ``segment_index``; unstable finals that
+supersede the previous unstable) and returns the accumulated committed transcript — the caller
+emits ``TranscriptionDone``.
+
+Invariants enforced here (contracts/emission-semantics.md):
+- I1/I2: committed text is append-only; the returned transcript is exactly
+  the **verbatim** concatenation of committed emissions — chunks keep their
+  natural inter-word whitespace (whisper word/segment texts carry leading
+  spaces); only the utterance's first chunk sheds its leading space. A
+  consumer reconstructs the transcript by concatenating, never by joining.
+- I3: unstable emissions never carry a segment_index and never touch
+  committed text. Unstable display text is the *uncommitted remainder* of the
+  current hypothesis (overlap-deduped like commits) — it never restates text
+  a previous commit already emitted.
+- I4/I5: end-of-audio resolves the outstanding unstable tail — the remainder
+  is committed (or dropped if empty) before return.
+- I6: RollingWindow never holds more than its cap, and no decode input exceeds
+  it. When a full window meets more audio the loop processes the whole window
+  and retires it keeping only the overlap, whether or not it produced text.
+
+The ``decode`` callable is injectable so the loop is testable without a model
+and reusable across adapters (whisper re-decode, parakeet chunk-commit).
+Signature: ``decode(samples: np.ndarray, offset_seconds: float) -> Hypothesis``
+with word/segment times in *absolute* session seconds (offset added). It runs
+in a worker thread.
+
+``telemetry`` (perf T03, ``myna.testbed.harness.StreamingTelemetry``) is an
+optional accumulator that records every decode call's kind/window/wall time
+without touching commit or alignment logic - ``None`` on every production
+call path, so it costs nothing there.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import functools
+import re
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager, nullcontext
+
+import numpy as np
+from numpy.typing import NDArray
+
+from myna.core import (
+    Disposition,
+    EventSink,
+    PcmChunk,
+    TranscriptionFinal,
+    TranscriptionProgress,
+)
+from myna.testbed.harness import StreamingTelemetry
+
+from .strategies import (
+    TAIL_GUARD_S,
+    UNSPACED_CHARS,
+    Hypothesis,
+    LocalAgreement,
+    SilenceCut,
+    Word,
+    boundary_commit,
+)
+from .window import RATE, RollingWindow, to_samples
+
+# Tracy frame marks (dev tooling only, see myna.testbed.parakeet._TRACY):
+# one frame per decode call, named by kind, so Tracy's frame-time view shows
+# the streaming duty cycle directly - gaps between frames are idle time,
+# frame width is decode wall time.
+try:
+    from tracy_client import ScopedFrame as _TracyFrame
+
+    _TRACY = True
+except ImportError:
+    _TRACY = False
+
+
+def _frame(name: str) -> AbstractContextManager[None]:
+    return _TracyFrame(name) if _TRACY else nullcontext()
+
+
+MIN_DECODE_S = 0.3  # don't bother decoding sub-300ms tails
+_OVERLAP_LOOKBACK = 12  # words of committed history text-alignment dedupe uses
+
+# The share of audio time partial ticks may spend decoding.
+#
+# A tick costs what the uncommitted window costs, and that window grows until
+# something cuts it - on the parakeet int8 CPU engine one tick measures 211 ms
+# at 10 s, 1088 ms at 40 s and 2416 ms at 60 s (the force cut). A *fixed*
+# cadence therefore has no bound at all in the only unit that matters: at 0.5 s
+# it asks for 4.8 s of decode per second of audio once the window is full, and
+# the session stops keeping up with real time. What falls behind is not only
+# the display - the loop is sequential, so the backlog delays the cut decodes
+# that produce *committed* text too, and the ingress queue absorbs the rest.
+#
+# So the spacing between ticks is the last tick's own wall time divided by this
+# fraction, whenever that exceeds the configured cadence: partial work per
+# second of audio is then bounded by the fraction on any machine and at any
+# window length, and the display refreshes more slowly exactly when a refresh
+# got expensive. It is the display's own budget - the cut decodes that commit
+# text are never skipped or delayed by it. The rest of the second is left for
+# them, for the resampler and for everything else sharing the CPU.
+PARTIAL_BUDGET = 0.5
+
+
+# Minimum character overlap for the alignment to act: 1-char matches are too
+# weak to drop on (single letters are everywhere); shorter matches fall back
+# to the timestamp signal.
+_MIN_OVERLAP_CHARS = 2
+
+# Old content in a re-decode is physically bounded: it re-transcribes only
+# the RollingWindow's 1 s of pre-frontier overlap audio, so the duplicate
+# region is always a short *prefix* of the new hypothesis. At conversational
+# speech rates the overlap holds ~2-3 words; 5 is a generous bound (300 wpm
+# for a full second). A claimed duplicate region LONGER than that is new
+# text coincidentally repeating committed text, and the alignment must
+# abstain — matching there eats genuinely-new words (observed 2026-07-28,
+# stream-2277-02/tail-mutation: committed "...the ball. No answer." +
+# decode "he rang again this time harder still no answer" — the clipped
+# overlap never re-surfaced the OLD "no answer", so the only match was the
+# genuinely-new final one and the whole 9-word tail dropped). If
+# `overlap_seconds` ever grows past ~2 s this bound should grow with it.
+# A single character of an unspaced script is about a syllable, so two of
+# them weigh one word against the bound.
+_MAX_OVERLAP_WORDS = 5
+_UNSPACED_CHAR = re.compile(f"[{UNSPACED_CHARS}]")
+
+
+def _overlap_weight(part: str) -> float:
+    if not part:
+        return 0.0
+    return 0.5 if len(part) == 1 and _UNSPACED_CHAR.match(part) else 1.0
+
+
+def _squash(text: str) -> str:
+    """Lowercased alphanumerics only — word boundaries and punctuation vanish,
+    so merged/split re-decode tokens still align with the words they came
+    from ("es"+"Carlos." ≈ "escarlos")."""
+    return "".join(c for c in text.lower() if c.isalnum())
+
+
+def _alignment_drop(tail: list[str], new: list[str]) -> int:
+    """How many leading words of `new` correspond to already-committed text.
+
+    Anchored on the *committed frontier*, at **character** level: word texts
+    are squashed ([`_squash`]) and the longest suffix of the committed tail
+    occurring in the new stream (leftmost occurrence) marks the duplicate
+    region — everything up to its end is old. Character matching survives
+    the two ways word-level matching fails:
+    - decode churn inside the overlap window ("in some way or" → "and some
+      white or" — the exact prefix==suffix match returned 0: "or or");
+    - word-boundary churn after a pause — the re-decode merges committed
+      words into one token ("es"+"Carlos." → " escarlos.") or splits them
+      (observed live 2026-07-28: "escarlos." re-committed).
+    A match must end where a word of the new stream ends; one ending
+    mid-word is a coincidence inside genuinely new text and the alignment
+    abstains. A word with no alphanumerics (punctuation such as "。") drops
+    only inside the region. Greedy global
+    matchers (difflib) are avoided deliberately: they can partition away the
+    frontier run when genuinely-new words after it match older committed
+    words.
+
+    The claimed duplicate region is bounded at [`_MAX_OVERLAP_WORDS`]
+    words, two unspaced-script characters to a word: old content
+    re-transcribes only the window's 1 s overlap audio, so it is always a
+    short prefix of the hypothesis. A match implying a
+    longer drop is new text coincidentally repeating committed text — the
+    alignment ABSTAINS (returns 0) rather than dropping new words, and does
+    not fall through to shorter suffixes: those would match the same
+    out-of-region text more loosely (a 2-char suffix like "er" lives inside
+    "harder"), compounding the loss. Under-dropping leaks a visible
+    duplicate; over-dropping silently loses words — on ambiguity, keep the
+    words.
+    """
+    if not tail or not new:
+        return 0
+    tail_squash = _squash("".join(tail))
+    parts = [_squash(w) for w in new]
+    new_squash = "".join(parts)
+    if not tail_squash or not new_squash:
+        return 0
+    end = 0
+    max_k = min(len(tail_squash), len(new_squash))
+    for k in range(max_k, _MIN_OVERLAP_CHARS - 1, -1):
+        j = new_squash.find(tail_squash[-k:])
+        if j < 0:
+            continue  # this length absent; try a shorter suffix
+        end = j + k
+        break
+    if not end:
+        return 0
+    drop = 0
+    covered = 0
+    weight = 0.0
+    for part in parts:
+        if covered == end or covered + len(part) > end:
+            break
+        covered += len(part)
+        weight += _overlap_weight(part)
+        drop += 1
+    if covered != end:
+        # The match ends inside a word: re-transcribed words end where words
+        # end, so this is a coincidence within new text ("es" in "less").
+        return 0
+    if weight > _MAX_OVERLAP_WORDS:
+        # The match claims more words than the overlap audio can hold — it
+        # is new text repeating committed text (see _MAX_OVERLAP_WORDS).
+        # Abstain entirely: no shorter-suffix retry (same spurious region,
+        # looser match), no partial drop (the match is either wholly the
+        # overlap re-transcription or wholly coincidence).
+        return 0
+    return drop
+
+
+def _drop_resegmented(
+    kept: list[Word], words: list[Word], committed_word_texts: list[str]
+) -> list[Word]:
+    """Drop the leading surviving word when it is the last committed word
+    re-segmented into a truncation of itself.
+
+    The third dedupe signal, for what the other two structurally cannot see
+    (measured live 2026-09-11, real dedupe trace):
+
+        through=1.560  tail=['little','wrinkles','gathered']
+        in=[' Many'(0.56,0.70), ' little'(0.70,0.94), ' wrinkles'(0.94,1.22),
+            ' gather'(1.22,1.61), ' between', ...]
+        -> kept=[' gather', ' between', ...]      # "gathered gather"
+
+    "gathered" was committed; the re-decode of the overlap emitted "gather" —
+    the trailing "ed" migrated to the next token. Neither existing signal sees
+    it: the word ends *after* the committed frontier (so the timestamp rule
+    keeps it) and [`_alignment_drop`] is anchored on the committed tail's
+    suffix, which a truncation of its last word cannot contain.
+
+    Applied to the *surviving* head rather than the raw input head: which
+    signal removed the words in front of it varies (here it was timestamps,
+    with the alignment abstaining), so the rule keys off the boundary itself.
+
+    Gated on something having been dropped in front of it — i.e. this really is
+    the far edge of an overlap region. That gate is what protects genuinely new
+    speech which happens to repeat a prefix of the committed tail: with no
+    overlap, nothing precedes it and the rule never fires.
+
+    Only the prefix direction is handled. The reverse — committed "gather",
+    re-decoded as "gathered" — would have to drop the whole word to remove the
+    duplicate, losing the new suffix with it; per this module's policy
+    (under-drop leaks a visible duplicate, over-drop silently loses words), on
+    that ambiguity keep the words.
+    """
+    if not kept or len(kept) == len(words) or not committed_word_texts:
+        return kept
+    head = _squash(_norm(kept[0].text))
+    last = _squash(committed_word_texts[-1])
+    if len(head) < _MIN_OVERLAP_CHARS or head == last or not last.startswith(head):
+        return kept
+    return kept[1:]
+
+
+def _drop_committed(
+    words: list[Word],
+    committed_word_texts: list[str],
+    committed_through: float,
+) -> list[Word]:
+    """Overlap dedupe (I2): drop words a previous commit already emitted.
+
+    Three signals, unioned (a word is dropped if ANY marks it old):
+    (a) timestamp — the word ends at/before the committed coverage;
+    (b) character-level text alignment — the word sits inside the duplicate
+    region reaching the committed frontier ([`_alignment_drop`]);
+    (c) the leading *surviving* word is the last committed word re-segmented
+    re-segmented the last committed word ([`_drop_resegmented`]), which (a) and
+    (b) structurally cannot see. The
+    alignment drop is **not** gated on timestamps: after a long silence the
+    (VAD-free) re-decode compresses the pause and re-times already-committed
+    overlap words arbitrarily late — observed live 2026-07-28 ("quite well."
+    + [16 s silence] + "My name is Charlie" injected as "quite well. well.
+    My name is Charlie") — so alignment is the only trustworthy dedupe
+    signal there. The accepted trade-off: a genuinely *new* word that exactly
+    repeats the frontier suffix is dropped when the overlap decode failed to
+    re-transcribe the old instance (rare; a visible duplicate on every pause
+    is worse, and the leftmost-longest rule keeps later repeats: "no. No
+    way." survives).
+    """
+    tail = committed_word_texts[-_OVERLAP_LOOKBACK:]
+    new = [_norm(w.text) for w in words]
+    drop = _alignment_drop(tail, new)
+    kept = [w for i, w in enumerate(words) if not (w.end <= committed_through + 1e-3 or i < drop)]
+    return _drop_resegmented(kept, words, committed_word_texts)
+
+
+def _norm(text: str) -> str:
+    return text.strip().lower().strip(".,!?;:\"'“”")
+
+
+def _join_natural(words: list[Word]) -> str:
+    """Verbatim word-text join (natural spacing): whisper word texts carry
+    their own leading whitespace, so joining verbatim keeps inter-word
+    spaces. Only trailing whitespace is trimmed."""
+    return "".join(w.text for w in words).rstrip()
+
+
+def _utterance_edge(text: str, first: bool) -> str:
+    """Strip the leading space of an utterance's *first* emission only —
+    later chunks keep theirs so verbatim concatenation reconstructs the
+    transcript (I2). Applies to committed and unstable emissions alike, so
+    in-field preedit renders correctly after committed text."""
+    return text.lstrip() if first else text
+
+
+async def _chunked_partial(
+    window: RollingWindow,
+    run_decode: Callable[[NDArray[np.float32], float], Awaitable[Hypothesis]],
+    fresh_words: Callable[[list[Word]], list[Word]],
+    tail_seconds: float | None,
+) -> list[Word] | None:
+    """One unstable tick for a chunked strategy — display text only.
+
+    Decodes the whole uncommitted window, so what is shown is always a single
+    self-consistent hypothesis that grows as the speaker talks. ``None`` says
+    "nothing to show this tick": leave whatever is on screen alone rather than
+    blanking it, because an empty decode is more often the encoder faltering
+    on this particular window than the speaker having said nothing.
+
+    ``tail_seconds`` caps the decode at the last N seconds for machines that
+    need the compute back. It is off by default, and it is a real trade, not a
+    free optimisation: the display then shows only those N seconds and drops
+    its head as the window slides. Stitching a longer display out of
+    successive tails was tried and abandoned (2026-08-28) — each tick can only
+    contribute its own first second to the stitched head, and a decode's first
+    second is its least reliable part, so the head accumulated into nonsense
+    ("Many little wrinkles his brow He could Arranged that Satisfactorily")
+    while the full-window decode of the same audio read cleanly.
+    """
+    if tail_seconds and window.window_seconds > tail_seconds:
+        first = window.received - to_samples(tail_seconds)
+        offset, samples = first / RATE, window.samples(first=first)
+    else:
+        offset, samples = window.start, window.samples()
+    hyp = await run_decode(samples, offset)
+    return fresh_words(hyp.words) or None
+
+
+async def run_streaming_loop(
+    audio: AsyncIterator[PcmChunk],
+    emit: EventSink,
+    decode: Callable[[NDArray[np.float32], float], Hypothesis],
+    strategy: LocalAgreement | SilenceCut,
+    cadence_seconds: float = 1.0,
+    window_cap_seconds: float = 30.0,
+    overlap_seconds: float = 1.0,
+    partial_cadence_seconds: float | None = None,
+    partial_tail_seconds: float | None = None,
+    telemetry: StreamingTelemetry | None = None,
+    *,
+    on_commit: Callable[[str, list[Word]], Awaitable[None]] | None = None,
+    silence_cut_overlap: bool = True,
+    min_utterance_seconds: float = MIN_DECODE_S,
+    partial_budget: float | None = None,
+) -> str:
+    """``on_commit`` receives each committed text with its words instead of
+    the wire (deferred presentation). ``silence_cut_overlap=False`` retires a
+    pause cut without overlap, as murmure does: its trailing silence means no
+    word straddles it, so only forced cuts keep audio to deduplicate.
+    ``min_utterance_seconds`` is the shortest utterance worth a decode.
+    ``partial_budget`` overrides [`PARTIAL_BUDGET`]."""
+    # Every decode in a session runs on this one thread. `asyncio.to_thread`
+    # would use the event loop's default pool, which grows to min(32, cpu + 4)
+    # workers even under a strictly sequential caller — a submit that lands
+    # before the previous worker has released the idle semaphore spawns
+    # another. Harmless at one decode per utterance; at two per second it
+    # reached the cap, and since each thread takes a glibc malloc arena, RSS
+    # climbed ~500 MB over a five-minute session. There is nothing to gain
+    # from a wider pool: decodes here are strictly sequential and ORT already
+    # parallelises inside one.
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="myna-decode")
+
+    async def run_decode(samples: NDArray[np.float32], offset: float) -> Hypothesis:
+        return await asyncio.get_running_loop().run_in_executor(executor, decode, samples, offset)
+
+    try:
+        return await _run(
+            audio,
+            emit,
+            run_decode,
+            strategy,
+            cadence_seconds,
+            window_cap_seconds,
+            overlap_seconds,
+            partial_cadence_seconds,
+            partial_tail_seconds,
+            telemetry=telemetry,
+            on_commit=on_commit,
+            silence_cut_overlap=silence_cut_overlap,
+            min_utterance_seconds=min_utterance_seconds,
+            partial_budget=partial_budget,
+        )
+    finally:
+        executor.shutdown(wait=False)
+
+
+async def _run(
+    audio: AsyncIterator[PcmChunk],
+    emit: EventSink,
+    run_decode: Callable[[NDArray[np.float32], float], Awaitable[Hypothesis]],
+    strategy: LocalAgreement | SilenceCut,
+    cadence_seconds: float,
+    window_cap_seconds: float,
+    overlap_seconds: float,
+    partial_cadence_seconds: float | None,
+    partial_tail_seconds: float | None,
+    telemetry: StreamingTelemetry | None = None,
+    on_commit: Callable[[str, list[Word]], Awaitable[None]] | None = None,
+    silence_cut_overlap: bool = True,
+    min_utterance_seconds: float = MIN_DECODE_S,
+    partial_budget: float | None = None,
+) -> str:
+    # perf T03: additive, outside the commit/alignment logic below -- with
+    # telemetry=None (every production call today) this is one branch per
+    # decode and costs nothing.
+    session_t0 = time.perf_counter() if telemetry is not None else 0.0
+
+    async def timed_decode(samples: NDArray[np.float32], offset: float, kind: str) -> Hypothesis:
+        with _frame(f"decode:{kind}"):
+            if telemetry is None:
+                return await run_decode(samples, offset)
+            t0 = time.perf_counter()
+            hyp = await run_decode(samples, offset)
+            telemetry.record(kind, len(samples) / RATE, time.perf_counter() - t0)
+            return hyp
+
+    budget = PARTIAL_BUDGET if partial_budget is None else partial_budget
+    window = RollingWindow(window_cap_seconds, overlap_seconds)
+    committed: list[str] = []
+    committed_through = 0.0  # text-commit watermark, word-timestamp seconds
+    committed_word_texts: list[str] = []  # dedupe history, bounded to _OVERLAP_LOOKBACK
+    segment_index = 0
+    last_hyp: Hypothesis | None = None
+    last_unstable = ""
+    last_decode_end = 0.0
+    last_partial_wall = 0.0  # what the next tick is expected to cost
+
+    async def emit_committed(text: str, words: list[Word]) -> None:
+        nonlocal segment_index
+        if on_commit is not None:
+            await on_commit(text, words)
+        else:
+            await emit(
+                TranscriptionFinal(
+                    text=text,
+                    disposition=Disposition.COMMITTED,
+                    segment_index=segment_index,
+                )
+            )
+        committed.append(text)
+        committed_word_texts.extend(_norm(w.text) for w in words)
+        del committed_word_texts[:-_OVERLAP_LOOKBACK]
+        segment_index += 1
+
+    async def emit_unstable(text: str) -> None:
+        nonlocal last_unstable
+        if text and text != last_unstable:
+            await emit(TranscriptionFinal(text=text, disposition=Disposition.UNSTABLE))
+            last_unstable = text
+
+    def fresh_words(words: list[Word]) -> list[Word]:
+        """Overlap dedupe (I2) — see module-level [`_drop_committed`]. A window
+        holding no already-processed audio has nothing to deduplicate."""
+        if window.retained_start >= window.processed_through:
+            return words
+        return _drop_committed(words, committed_word_texts, committed_through)
+
+    async def commit(words: tuple[Word, ...] | list[Word]) -> bool:
+        fresh = fresh_words(list(words))
+        text = _join_natural(fresh)
+        if text:
+            await emit_committed(_utterance_edge(text, not committed), fresh)
+        return bool(text)
+
+    async def cut_region(cut: int, *, forced: bool, keep_overlap: bool) -> None:
+        """Decode [start, cut) once, commit it and retire it (chunked).
+
+        A cut that keeps overlap holds back the words the next region decodes
+        again - at a pause cut only those starting in its last TAIL_GUARD_S,
+        which the next region hears with context - and stops the text
+        watermark at the last word it committed, so the next region can still
+        commit a word this decode missed: the VAD can cut at a gap too short
+        to be silence to the decoder. A cut without overlap commits all."""
+        nonlocal committed_through, last_unstable, last_partial_wall
+        hyp = await timed_decode(window.samples(end=cut), window.start, "commit")
+        if not keep_overlap:
+            await commit(hyp.words)
+            committed_through = max(committed_through, cut / RATE)
+        else:
+            held = window.overlap if forced else to_samples(TAIL_GUARD_S)
+            retain_from = max(window.retained_start, cut - held)
+            decision = boundary_commit(hyp, cut / RATE, retain_from / RATE)
+            if decision is not None:
+                await commit(decision.commit_words)
+                committed_through = max(committed_through, decision.commit_end)
+        window.retire(cut, keep_overlap=keep_overlap)
+        last_unstable = ""  # I4: the commit resolves the epoch
+        last_partial_wall = 0.0  # the window shrank; its cost estimate is stale
+
+    async def force_boundary() -> None:
+        """The window is full and audio is still waiting: final-process the
+        whole window, then retire it keeping only the overlap."""
+        nonlocal committed_through, last_hyp, last_unstable
+        cut = window.received
+        if isinstance(strategy, SilenceCut):
+            strategy.mark_cut(cut / RATE)
+            await cut_region(cut, forced=True, keep_overlap=True)
+            return
+        hyp = await timed_decode(window.samples(), window.start, "commit")
+        decision = strategy.boundary_commit(hyp, cut / RATE, (cut - window.overlap) / RATE)
+        if decision is not None:
+            if await commit(decision.commit_words):
+                last_unstable = ""
+            committed_through = max(committed_through, decision.commit_end)
+        last_hyp = None
+        window.retire(cut)
+
+    async for chunk in audio:
+        pending = memoryview(chunk.data)
+        cut_taken = False
+        while True:
+            pending = pending[window.fill(pending) :]
+            if isinstance(strategy, SilenceCut):
+                while True:
+                    unscanned = strategy.unscanned_offset(window.start)
+                    cut = strategy.observe(
+                        window.samples(first=window.retained_start + unscanned),
+                        window.start,
+                        window.end,
+                        offset=unscanned,
+                    )
+                    if cut is None or cut.at - window.start < MIN_DECODE_S:
+                        break
+                    if to_samples(cut.at) <= window.processed_through:
+                        break  # a force cut no longer than the overlap
+                    # Retiring without overlap is only safe where the cut is
+                    # verified silence; anything else keeps the overlap that
+                    # lets a word straddling the cut survive it.
+                    await cut_region(
+                        to_samples(cut.at),
+                        forced=cut.forced,
+                        keep_overlap=cut.forced or silence_cut_overlap or not cut.silent,
+                    )
+                    cut_taken = True
+            if not pending:
+                break
+            await force_boundary()
+            cut_taken = True
+
+        if isinstance(strategy, SilenceCut):
+            if cut_taken:
+                continue
+            spacing = partial_cadence_seconds or cadence_seconds
+            if partial_cadence_seconds and budget > 0:
+                spacing = max(spacing, last_partial_wall / budget)  # see PARTIAL_BUDGET
+            if window.end - last_decode_end >= spacing:
+                last_decode_end = window.end
+                if partial_cadence_seconds and window.window_seconds >= MIN_DECODE_S:
+                    tick_t0 = time.perf_counter()
+                    words = await _chunked_partial(
+                        window,
+                        functools.partial(timed_decode, kind="partial"),
+                        fresh_words,
+                        partial_tail_seconds,
+                    )
+                    last_partial_wall = time.perf_counter() - tick_t0
+                    text = _utterance_edge(_join_natural(words), not committed) if words else ""
+                    if text:
+                        await emit_unstable(text)
+                    else:
+                        await emit(TranscriptionProgress())
+                else:
+                    await emit(TranscriptionProgress())  # liveness on quiet ticks
+            continue
+
+        # tick on cadence
+        if window.end - last_decode_end < cadence_seconds:
+            continue
+        last_decode_end = window.end
+        hyp = await timed_decode(window.samples(), window.start, "tick")
+        decision = strategy.commit_rule(last_hyp, hyp, window.end)
+        last_hyp = hyp
+        produced = False
+        if decision is not None and decision.commit_end > committed_through:
+            if await commit(decision.commit_words):
+                last_unstable = ""  # I4: commit clears unstable
+                produced = True
+            # Retire the agreed audio even when every word was a duplicate.
+            committed_through = decision.commit_end
+            window.retire(to_samples(decision.commit_end))
+        before = last_unstable
+        # Unstable display text = the *uncommitted remainder* of the current
+        # hypothesis (same overlap dedupe as commits) — never restates text a
+        # previous commit already emitted, and keeps its natural leading space
+        # so in-field preedit renders correctly after committed text.
+        unstable_tail = _utterance_edge(_join_natural(fresh_words(hyp.words)), not committed)
+        await emit_unstable(unstable_tail)
+        produced = produced or last_unstable != before
+        if not produced:
+            await emit(TranscriptionProgress())  # liveness on quiet ticks
+
+    # I5: resolve the tail. MIN_DECODE_S skips an utterance too short to be
+    # worth a decode, never the remainder a cut left behind - unless that
+    # remainder carries no overlap and the VAD heard nothing in it: whisper
+    # and SenseVoice hallucinate on a region of pure silence.
+    silent_remainder = (
+        isinstance(strategy, SilenceCut)
+        and window.processed_through > 0
+        and window.retained_start >= window.processed_through
+        and not strategy.heard_since_cut
+    )
+    if (
+        window.received > window.processed_through
+        and not silent_remainder
+        and (window.processed_through or window.window_seconds >= min_utterance_seconds)
+    ):
+        hyp = await timed_decode(window.samples(), window.start, "commit")
+        await commit(hyp.words)
+    if telemetry is not None:
+        telemetry.audio_seconds_ingested = window.end
+        telemetry.session_seconds = time.perf_counter() - session_t0
+    return "".join(committed)

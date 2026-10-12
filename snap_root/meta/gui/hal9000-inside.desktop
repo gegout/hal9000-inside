@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=HAL 9000 Inside
+Exec=hal9000-inside run
+Icon=terminal
+Type=Application
+Categories=Utility;AudioVideo;

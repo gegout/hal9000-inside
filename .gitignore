@@ -1,0 +1,21 @@
+# Virtual environment
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# Snap artifacts
+*.snap
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Temporary test artifacts
+tests/__pycache__/
+snap_root/hal9000_inside/__pycache__/
