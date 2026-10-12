@@ -28,7 +28,7 @@ from hal9000_inside.audio import (
     list_audio_devices,
 )
 from hal9000_inside.hardware import ComputeDeviceConfig, detect_system_gpus
-from hal9000_inside.llm import LLMClient, HAL9000_SYSTEM_PROMPT
+from hal9000_inside.llm import LLMClient, LLMRouter, HAL9000_SYSTEM_PROMPT
 from hal9000_inside.memory import MemoryStore, MultilingualE5Embedder
 from hal9000_inside.mcp import MCPClientManager
 from hal9000_inside.cognition.interoception import InteroceptionMonitor
@@ -70,6 +70,11 @@ class Hal9000Assistant:
         self.playback = audio_sink or AlsaPlayback(sample_rate=22050)
         
         self.llm = llm or LLMClient(model=model_override, base_url=endpoint_override)
+        if isinstance(self.llm, LLMRouter):
+            self.router = self.llm
+        else:
+            self.router = LLMRouter(remote_client=self.llm if not getattr(self.llm, 'is_local', False) else None,
+                                    local_client=self.llm if getattr(self.llm, 'is_local', False) else None)
         if memory is not None:
             self.memory = memory
         else:
@@ -305,8 +310,14 @@ class Hal9000Assistant:
         t_llm_start = time.perf_counter()
         tool_call_count = 0
         llm_error_count = 0
+        used_route = route_name
+        used_model = getattr(self.llm, "model", "unknown")
+        hal_reply = ""
+
         try:
-            resp_msg = await self.llm.generate_response(messages, tools=tools, return_dict=True, max_tokens=256)
+            resp_msg, used_route, used_model = await self.router.generate(
+                messages, tools=tools, return_dict=True, max_tokens=256
+            )
             
             # Check if LLM requested MCP tool execution
             if isinstance(resp_msg, dict) and resp_msg.get("tool_calls"):
@@ -335,7 +346,9 @@ class Hal9000Assistant:
                     })
 
                 # Follow-up completion after tool execution
-                second_resp = await self.llm.generate_response(messages, max_tokens=256)
+                second_resp, used_route, used_model = await self.router.generate(
+                    messages, max_tokens=256
+                )
                 if isinstance(second_resp, dict):
                     hal_reply = second_resp.get("content") or "Action completed."
                 else:
@@ -358,21 +371,31 @@ class Hal9000Assistant:
         self.ui.show_hal_reply(hal_reply)
         asst_turn_id = self.memory.record_turn("assistant", hal_reply, session_id=self.current_episode_id)
 
-        # 5. Synthesize and speak response
+        # 5. Synthesize and speak response (using sentence streaming pipelining)
         self.ui.set_state("RESPONDING")
         self.audio_ctrl.notify_playback_started()
 
         t_tts_start = time.perf_counter()
         tts_first_audio_ms = 0.0
-        try:
-            # Generate WAV audio with resident Piper
-            loop = asyncio.get_running_loop()
-            raw_pcm_22k = await loop.run_in_executor(None, self.tts.synthesize_raw_pcm, hal_reply)
-            tts_first_audio_ms = (time.perf_counter() - t_tts_start) * 1000.0
-            
+        first_audio_recorded = False
+
+        def _play_chunk(pcm_chunk: bytes):
+            nonlocal tts_first_audio_ms, first_audio_recorded
+            if not first_audio_recorded:
+                tts_first_audio_ms = (time.perf_counter() - t_tts_start) * 1000.0
+                first_audio_recorded = True
             if not self._cancel_current:
-                # Play audio via ALSA / Sink
-                await loop.run_in_executor(None, self.playback.play_pcm, raw_pcm_22k)
+                self.playback.play_pcm(pcm_chunk)
+
+        try:
+            if hasattr(self.tts, "speak_sentences"):
+                await self.tts.speak_sentences(hal_reply, on_audio_chunk=_play_chunk)
+            else:
+                loop = asyncio.get_running_loop()
+                raw_pcm_22k = await loop.run_in_executor(None, self.tts.synthesize_raw_pcm, hal_reply)
+                tts_first_audio_ms = (time.perf_counter() - t_tts_start) * 1000.0
+                if not self._cancel_current:
+                    await loop.run_in_executor(None, self.playback.play_pcm, raw_pcm_22k)
         finally:
             self.audio_ctrl.notify_playback_stopped()
 
@@ -381,8 +404,8 @@ class Hal9000Assistant:
         # Record telemetry in database
         self.memory.record_turn_telemetry(
             turn_id=asst_turn_id,
-            model_id=self.llm.model,
-            route=route_name,
+            model_id=used_model,
+            route=used_route,
             stt_ms=stt_ms,
             retrieval_ms=retrieval_ms,
             llm_ms=llm_ms,

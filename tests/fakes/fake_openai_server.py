@@ -16,6 +16,10 @@ class FakeOpenAIServer:
         self.error_status: Optional[int] = None
         self.refuse_connection: bool = False
 
+    def enqueue_error(self, status_code: int = 500, error_message: str = "Fake server error"):
+        """Queue an HTTP error response."""
+        self.responses.append({"_is_error": True, "status_code": status_code, "message": error_message})
+
     def enqueue_response(self, content: str, tool_calls: Optional[List[Dict[str, Any]]] = None, finish_reason: str = "stop"):
         """Queue a scripted response."""
         msg: Dict[str, Any] = {"role": "assistant", "content": content}
@@ -88,6 +92,11 @@ class FakeOpenAIServer:
             )
 
         resp_data = self.responses.pop(0)
+
+        if isinstance(resp_data, dict) and resp_data.get("_is_error"):
+            code = resp_data.get("status_code", 500)
+            msg = resp_data.get("message", "Error")
+            return httpx.Response(code, text=msg)
 
         if isinstance(resp_data, dict) and resp_data.get("_is_stream"):
             # Format SSE lines
