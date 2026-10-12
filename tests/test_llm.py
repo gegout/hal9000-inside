@@ -12,7 +12,11 @@ class TestLLM(unittest.TestCase):
         self.assertTrue(client.is_configured)
 
     def test_live_completion_and_retries(self):
-        client = LLMClient()
+        from tests.fakes import FakeOpenAIServer
+        fake_server = FakeOpenAIServer()
+        fake_server.enqueue_response("The AE-35 unit is operating 100% reliably.")
+
+        client = LLMClient(api_key="sk-fake-key", transport=fake_server.get_transport())
         messages = [
             {"role": "system", "content": "You are HAL 9000. Answer in one short sentence."},
             {"role": "user", "content": "What is the status of the AE-35 unit?"}
@@ -22,8 +26,8 @@ class TestLLM(unittest.TestCase):
         asyncio.set_event_loop(loop)
         try:
             reply = loop.run_until_complete(client.generate_response(messages, max_tokens=60))
-            self.assertTrue(len(reply) > 0)
-            self.assertIsInstance(reply, str)
+            self.assertEqual(reply, "The AE-35 unit is operating 100% reliably.")
+            self.assertEqual(len(fake_server.recorded_requests), 1)
         finally:
             loop.close()
 

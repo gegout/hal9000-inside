@@ -67,8 +67,17 @@ class MemoryStore:
             conn.commit()
 
     def _init_qdrant(self):
-        """Initialise embedded Qdrant client."""
-        self.qdrant = QdrantClient(path=self.qdrant_path)
+        """Initialise embedded Qdrant client with clear error if already locked."""
+        try:
+            self.qdrant = QdrantClient(path=self.qdrant_path)
+        except RuntimeError as e:
+            if "already accessed by another instance" in str(e):
+                raise RuntimeError(
+                    f"Qdrant storage folder at '{self.qdrant_path}' is locked by another running process "
+                    "(e.g., another HAL 9000 assistant or MCP server instance). Only one process can access "
+                    "embedded Qdrant simultaneously."
+                ) from e
+            raise
         collections = [c.name for c in self.qdrant.get_collections().collections]
         if COLLECTION_NAME not in collections:
             self.qdrant.create_collection(
@@ -152,29 +161,45 @@ class MemoryStore:
         return memories
 
     def correct(self, mem_id: str, new_text: str) -> bool:
-        """Update/supersede an existing memory."""
+        """Update/supersede an existing memory while preserving category and created_at."""
         ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
         vec = self.embedder.encode_passage(new_text)
 
-        # Update Qdrant
+        # Retrieve existing metadata
+        existing_category = "fact"
+        existing_created_at = ts
+        with sqlite3.connect(self.sqlite_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT category, created_at FROM memories WHERE id = ?", (mem_id,))
+            row = cursor.fetchone()
+            if row:
+                existing_category = row[0] or "fact"
+                existing_created_at = row[1] or ts
+
+            # Update SQLite
+            conn.execute(
+                "UPDATE memories SET text = ?, updated_at = ? WHERE id = ?",
+                (new_text, ts, mem_id),
+            )
+            conn.commit()
+
+        # Update Qdrant preserving category and created_at
         self.qdrant.upsert(
             collection_name=COLLECTION_NAME,
             points=[
                 PointStruct(
                     id=mem_id,
                     vector=vec,
-                    payload={"text": new_text, "updated_at": ts, "is_active": True},
+                    payload={
+                        "text": new_text,
+                        "category": existing_category,
+                        "created_at": existing_created_at,
+                        "updated_at": ts,
+                        "is_active": True,
+                    },
                 )
             ],
         )
-
-        # Update SQLite
-        with sqlite3.connect(self.sqlite_path) as conn:
-            conn.execute(
-                "UPDATE memories SET text = ?, updated_at = ? WHERE id = ?",
-                (new_text, ts, mem_id),
-            )
-            conn.commit()
         return True
 
     def forget(self, mem_id: str) -> bool:

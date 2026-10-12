@@ -145,8 +145,30 @@ class HalfDuplexAudioController:
         return True
 
 
-class AlsaPlayback:
-    """Reliable ALSA playback fallback via aplay subprocess when PortAudio is unavailable."""
+class AudioSink:
+    """Abstract interface for audio playback."""
+    def play_pcm(self, pcm_bytes: bytes):
+        raise NotImplementedError
+
+    def stop(self):
+        pass
+
+
+class AudioSource:
+    """Abstract interface for audio capture."""
+    async def stream_frames(self, frame_samples: int = 480) -> AsyncGenerator[bytes, None]:
+        raise NotImplementedError
+
+    def purge_buffered(self):
+        """Purge any stale audio buffered during a spoken turn."""
+        pass
+
+    def stop(self):
+        pass
+
+
+class AplaySink(AudioSink):
+    """ALSA playback via aplay subprocess."""
     def __init__(self, sample_rate: int = 22050):
         self.sample_rate = sample_rate
         self._proc = None
@@ -161,7 +183,7 @@ class AlsaPlayback:
             )
             self._proc.communicate(input=pcm_bytes)
         except Exception as e:
-            logger.debug(f"AlsaPlayback error: {e}")
+            logger.debug(f"AplaySink error: {e}")
         finally:
             self._proc = None
 
@@ -174,7 +196,40 @@ class AlsaPlayback:
             self._proc = None
 
 
-class AlsaCapture:
+# Backward compatibility alias
+AlsaPlayback = AplaySink
+
+
+class WavFileSink(AudioSink):
+    """Saves synthesized audio to a WAV file."""
+    def __init__(self, file_path: str, sample_rate: int = 22050):
+        self.file_path = file_path
+        self.sample_rate = sample_rate
+        self._all_pcm = bytearray()
+
+    def play_pcm(self, pcm_bytes: bytes):
+        import wave
+        self._all_pcm.extend(pcm_bytes)
+        with wave.open(self.file_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self.sample_rate)
+            wf.writeframes(bytes(self._all_pcm))
+
+    def stop(self):
+        pass
+
+
+class NullSink(AudioSink):
+    """Discards synthesized audio (useful for silent benchmarks & tests)."""
+    def play_pcm(self, pcm_bytes: bytes):
+        pass
+
+    def stop(self):
+        pass
+
+
+class ArecordSource(AudioSource):
     """Streams 16-bit mono 16kHz audio from microphone using arecord."""
     def __init__(self, sample_rate: int = 16000, device: Optional[str] = None):
         self.sample_rate = sample_rate
@@ -203,6 +258,19 @@ class AlsaCapture:
         finally:
             self.stop()
 
+    def purge_buffered(self):
+        """Purge buffered audio from arecord pipe so stale speech is discarded."""
+        if self._proc and self._proc.stdout:
+            try:
+                # Read whatever is currently in OS buffer without blocking
+                while True:
+                    # In asyncio StreamReader, _buffer holds unconsumed bytes
+                    if hasattr(self._proc.stdout, "_buffer") and self._proc.stdout._buffer:
+                        self._proc.stdout._buffer.clear()
+                    break
+            except Exception:
+                pass
+
     def stop(self):
         if self._proc:
             try:
@@ -210,6 +278,39 @@ class AlsaCapture:
             except Exception:
                 pass
             self._proc = None
+
+
+# Backward compatibility alias
+AlsaCapture = ArecordSource
+
+
+class WavFileSource(AudioSource):
+    """Reads 16-bit mono 16kHz PCM audio from a WAV file and streams frames."""
+    def __init__(self, file_path: str, sample_rate: int = 16000, real_time: bool = False):
+        import wave
+        self.sample_rate = sample_rate
+        self.real_time = real_time
+        with wave.open(file_path, "rb") as wf:
+            raw = wf.readframes(wf.getnframes())
+            sr = wf.getframerate()
+        self.pcm = resample_pcm(raw, sr, sample_rate)
+
+    async def stream_frames(self, frame_samples: int = 480) -> AsyncGenerator[bytes, None]:
+        chunk_size = frame_samples * 2
+        for i in range(0, len(self.pcm), chunk_size):
+            chunk = self.pcm[i:i + chunk_size]
+            if len(chunk) < chunk_size:
+                chunk = chunk + b"\x00" * (chunk_size - len(chunk))
+            if self.real_time:
+                await asyncio.sleep(frame_samples / self.sample_rate)
+            yield chunk
+
+        # Append trailing silence so VAD marks utterance_finished
+        silence_frame = b"\x00" * chunk_size
+        for _ in range(35):
+            if self.real_time:
+                await asyncio.sleep(frame_samples / self.sample_rate)
+            yield silence_frame
 
 
 def list_audio_devices():

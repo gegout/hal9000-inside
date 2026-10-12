@@ -19,6 +19,7 @@ dependencies = [
     "httpx",
     "pydantic",
     "qdrant-client",
+    "mcp",
 ]
 
 [project.scripts]

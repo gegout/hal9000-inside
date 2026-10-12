@@ -52,6 +52,12 @@ class Hal9000Assistant:
         auto_mode: bool = True,
         use_nvidia: Optional[bool] = None,
         use_intel: Optional[bool] = None,
+        audio_source: Optional[Any] = None,
+        audio_sink: Optional[Any] = None,
+        memory: Optional[Any] = None,
+        llm: Optional[Any] = None,
+        adapter: Optional[Any] = None,
+        tts: Optional[Any] = None,
     ):
         self.compute_config = ComputeDeviceConfig(use_nvidia=use_nvidia, use_intel=use_intel)
         self.ui = TerminalUI()
@@ -59,24 +65,34 @@ class Hal9000Assistant:
         self.audio_ctrl.set_auto_mode(auto_mode)
         
         self.capture_device = capture_device
-        self.playback = AlsaPlayback(sample_rate=22050)
+        self.audio_source = audio_source
+        self.playback = audio_sink or AlsaPlayback(sample_rate=22050)
         
-        self.llm = LLMClient(model=model_override, base_url=endpoint_override)
-        embedder_providers = self.compute_config.get_onnx_providers(prefer_gpu=True)
-        embedder = MultilingualE5Embedder(providers=embedder_providers)
-        self.memory = MemoryStore(embedder=embedder)
+        self.llm = llm or LLMClient(model=model_override, base_url=endpoint_override)
+        if memory is not None:
+            self.memory = memory
+        else:
+            embedder_providers = self.compute_config.get_onnx_providers(prefer_gpu=True)
+            embedder = MultilingualE5Embedder(providers=embedder_providers)
+            self.memory = MemoryStore(embedder=embedder)
         self.mcp = MCPClientManager()
         
         # HAL Piper TTS with CUDA only if onnxruntime has CUDA provider available
-        tts_cuda = self.compute_config.enable_nvidia and self.compute_config.has_cuda
-        self.tts = HalPiperTTS(use_cuda=tts_cuda)
+        if tts is not None:
+            self.tts = tts
+        else:
+            tts_cuda = self.compute_config.enable_nvidia and self.compute_config.has_cuda
+            self.tts = HalPiperTTS(use_cuda=tts_cuda)
+
         self.vad = SimpleVAD(sample_rate=16000, frame_duration_ms=30, min_silence_duration_ms=800)
         
         # Parakeet STT backend
-        stt_device = "cuda" if (self.compute_config.enable_nvidia and self.compute_config.has_cuda) else "cpu"
-        self.adapter = ParakeetAdapter(device=stt_device)
+        if adapter is not None:
+            self.adapter = adapter
+        else:
+            stt_device = "cuda" if (self.compute_config.enable_nvidia and self.compute_config.has_cuda) else "cpu"
+            self.adapter = ParakeetAdapter(device=stt_device)
 
-        
         self.running = False
         self._cancel_current = False
 
@@ -99,19 +115,20 @@ class Hal9000Assistant:
 
         # Step 3: Parakeet ASR Model
         self.ui.show_progress(3, total_steps, "Loading Parakeet ASR model...")
-        try:
-            await self.adapter._load_model()
-        except ValueError as ve:
-            if "int8 export; the cuda device needs fp32" in str(ve):
-                self.ui.show_warning("Parakeet int8 model requires CPU; falling back to CPU.")
-                self.adapter = ParakeetAdapter(device="cpu")
+        if hasattr(self.adapter, "_load_model"):
+            try:
                 await self.adapter._load_model()
-            else:
-                self.ui.show_error(f"Failed to load Parakeet STT: {ve}")
+            except ValueError as ve:
+                if "int8 export; the cuda device needs fp32" in str(ve):
+                    self.ui.show_warning("Parakeet int8 model requires CPU; falling back to CPU.")
+                    self.adapter = ParakeetAdapter(device="cpu")
+                    await self.adapter._load_model()
+                else:
+                    self.ui.show_error(f"Failed to load Parakeet STT: {ve}")
+                    raise
+            except Exception as e:
+                self.ui.show_error(f"Failed to load Parakeet STT: {e}")
                 raise
-        except Exception as e:
-            self.ui.show_error(f"Failed to load Parakeet STT: {e}")
-            raise
 
         # Step 4: LLM Connection
         self.ui.show_progress(4, total_steps, f"Checking LLM endpoint ({self.llm.model})...")
@@ -143,7 +160,7 @@ class Hal9000Assistant:
         await self.initialize()
         self.running = True
 
-        capture = AlsaCapture(sample_rate=16000, device=self.capture_device)
+        capture = self.audio_source or AlsaCapture(sample_rate=16000, device=self.capture_device)
         frame_samples = 480  # 30 ms @ 16 kHz
 
         # Start keyboard control listener in background
@@ -202,6 +219,7 @@ class Hal9000Assistant:
                     self.vad.reset()
                     
                     await self._handle_turn(audio_to_transcribe)
+                    capture.purge_buffered()
                     self.ui.set_state("LISTENING")
 
 

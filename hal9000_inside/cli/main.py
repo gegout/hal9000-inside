@@ -206,6 +206,16 @@ def cmd_run(args):
     elif getattr(args, "no_intel", False):
         use_intel = False
 
+    from hal9000_inside.audio import WavFileSource, WavFileSink
+
+    audio_source = None
+    if getattr(args, "input_wav", None):
+        audio_source = WavFileSource(args.input_wav, real_time=False)
+
+    audio_sink = None
+    if getattr(args, "output_wav", None):
+        audio_sink = WavFileSink(args.output_wav)
+
     assistant = Hal9000Assistant(
         capture_device=args.device,
         model_override=args.model,
@@ -213,6 +223,8 @@ def cmd_run(args):
         auto_mode=not args.push_to_talk,
         use_nvidia=use_nvidia,
         use_intel=use_intel,
+        audio_source=audio_source,
+        audio_sink=audio_sink,
     )
     try:
         asyncio.run(assistant.run())
@@ -260,6 +272,8 @@ def main():
     run_parser.add_argument("--device", help="ALSA capture device name (e.g. hw:CARD=Talk,DEV=0 or default)")
     run_parser.add_argument("--model", help="OpenAI-compatible model ID override (e.g. gemma4-e4b-ov)")
     run_parser.add_argument("--endpoint", help="OpenAI-compatible base URL override (e.g. http://127.0.0.1:8336/v3)")
+    run_parser.add_argument("--input-wav", help="Path to input WAV file to drive session from file instead of microphone")
+    run_parser.add_argument("--output-wav", help="Path to output WAV file to record assistant speech instead of speaker")
 
     # GPU options
     nvidia_group = run_parser.add_mutually_exclusive_group()

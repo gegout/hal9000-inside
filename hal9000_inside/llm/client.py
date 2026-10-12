@@ -1,10 +1,11 @@
 """OpenRouter LLM client with safe configuration loading and retry logic."""
 
+import asyncio
 import json
 import logging
 import os
 import re
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -110,12 +111,14 @@ class LLMClient:
         model: Optional[str] = None,
         timeout_seconds: float = 30.0,
         max_retries: int = 3,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
     ):
         self.api_key = api_key or load_openrouter_api_key()
         self.base_url = (base_url or load_llm_base_url()).rstrip("/")
         self.model = model or DEFAULT_MODEL
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
+        self.transport = transport
 
     @property
     def is_local(self) -> bool:
@@ -166,7 +169,7 @@ class LLMClient:
             if tool_choice:
                 payload["tool_choice"] = tool_choice
 
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+        async with httpx.AsyncClient(timeout=self.timeout_seconds, transport=self.transport) as client:
             for attempt in range(1, self.max_retries + 1):
                 try:
                     resp = await client.post(
@@ -227,7 +230,7 @@ class LLMClient:
             "stream": True,
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+        async with httpx.AsyncClient(timeout=self.timeout_seconds, transport=self.transport) as client:
             async with client.stream(
                 "POST",
                 f"{self.base_url}/chat/completions",

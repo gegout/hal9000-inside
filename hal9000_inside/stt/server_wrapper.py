@@ -44,8 +44,8 @@ class MynaServerDaemon:
 
         # Dynamically import Myna server and adapter
         from myna.testbed.parakeet import ParakeetAdapter
-        from myna.core.transport_ws import unix_serve
-        from myna.server.core import MynaServer
+        from myna.core import serve_unix
+        from myna.server.lifecycle import LifecycleService
 
         logger.info(f"Loading Myna ParakeetAdapter from {self.model_dir} (device={self.device})...")
         self._adapter = ParakeetAdapter(
@@ -56,9 +56,9 @@ class MynaServerDaemon:
             stream_silence_cut_s=self.stream_silence_cut_s,
         )
 
-        app = MynaServer(adapter=self._adapter)
+        lifecycle = LifecycleService(self._adapter)
         logger.info(f"Starting Myna WebSocket server on {self.socket_path}...")
-        self._server = await unix_serve(app, path=self.socket_path)
+        self._server = await serve_unix(lifecycle, self.socket_path)
         logger.info("Myna server started and listening.")
 
     async def stop(self):
