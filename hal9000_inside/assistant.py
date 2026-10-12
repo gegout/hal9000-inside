@@ -31,7 +31,15 @@ from hal9000_inside.hardware import ComputeDeviceConfig, detect_system_gpus
 from hal9000_inside.llm import LLMClient, LLMRouter, HAL9000_SYSTEM_PROMPT
 from hal9000_inside.memory import MemoryStore, MultilingualE5Embedder
 from hal9000_inside.mcp import MCPClientManager
-from hal9000_inside.cognition.interoception import InteroceptionMonitor
+from hal9000_inside.cognition import (
+    AttentionTracker,
+    BackgroundJob,
+    CognitiveScheduler,
+    CuriosityEngine,
+    InteroceptionMonitor,
+    PredictionEngine,
+    TurnDigestAnalyzer,
+)
 from hal9000_inside.tts import HalPiperTTS
 from hal9000_inside.ui import TerminalUI
 from myna.core import AudioFormat, PcmChunk, SessionConfig, TranscriptionDone
@@ -92,6 +100,11 @@ class Hal9000Assistant:
 
         self.vad = SimpleVAD(sample_rate=16000, frame_duration_ms=30, min_silence_duration_ms=800)
         self.interoception = InteroceptionMonitor()
+        self.scheduler = CognitiveScheduler()
+        self.digest_analyzer = TurnDigestAnalyzer(llm_client=self.router)
+        self.curiosity = CuriosityEngine(memory_store=self.memory, mcp_client=self.mcp, llm_client=self.router)
+        self.attention = AttentionTracker()
+        self.prediction = PredictionEngine(memory_store=self.memory)
         self.current_episode_id: Optional[str] = None
         self.last_latency_ms: Optional[float] = None
         
@@ -208,6 +221,7 @@ class Hal9000Assistant:
                     last_meter_update = now
 
                 if is_speaking:
+                    self.scheduler.on_speech_start()
                     if len(current_audio_buffer) == 0:
                         # Prepend pre-roll buffer so starting syllables are never clipped
                         for pre_frame in preroll_buffer:
@@ -218,7 +232,11 @@ class Hal9000Assistant:
                     current_audio_buffer.extend(frame)
                 else:
                     # Silence before speech: store in circular pre-roll
+                    self.scheduler.on_speech_end()
                     preroll_buffer.append(frame)
+                    # When idle, run queued cognitive jobs
+                    if not self.audio_ctrl.is_playing:
+                        await self.scheduler.run_once()
 
                 if utterance_finished and len(current_audio_buffer) > 16000 * 2 * 0.4:
                     # Speech turn completed
@@ -227,7 +245,11 @@ class Hal9000Assistant:
                     preroll_buffer.clear()
                     self.vad.reset()
                     
-                    await self._handle_turn(audio_to_transcribe)
+                    self.scheduler.on_turn_start()
+                    try:
+                        await self._handle_turn(audio_to_transcribe)
+                    finally:
+                        self.scheduler.on_turn_end()
                     capture.purge_buffered()
                     self.ui.set_state("LISTENING")
 
@@ -414,6 +436,68 @@ class Hal9000Assistant:
             tool_calls=tool_call_count,
             errors=llm_error_count,
             interrupted=1 if self._cancel_current else 0,
+        )
+
+        # Enqueue background turn digest and cognitive jobs
+        self._enqueue_post_turn_cognition(user_text, hal_reply)
+
+    def _enqueue_post_turn_cognition(self, user_text: str, hal_reply: str):
+        """Enqueue non-blocking turn digest and autonomous cognitive routines."""
+        async def _run_digest():
+            res = await self.digest_analyzer.analyze_turn(user_text, hal_reply)
+            if not res:
+                return
+
+            # 1. Update attention focus
+            if res.focus_topics:
+                self.attention.update_from_turn(res.focus_topics)
+
+            # 2. Update prediction
+            if res.predicted_followups:
+                self.prediction.set_predictions(res.predicted_followups)
+
+            # 3. Store extracted facts with provenance='assistant' or 'self'
+            for fact in res.facts_to_remember:
+                try:
+                    self.memory.remember(
+                        text=fact.text,
+                        category=fact.category,
+                        provenance="assistant",
+                        confidence=fact.confidence,
+                        salience=fact.salience,
+                    )
+                except Exception as fe:
+                    logger.debug(f"Failed to store digest fact: {fe}")
+
+            # 4. Handle user corrections if any
+            for corr in res.user_corrections:
+                if corr.target_id:
+                    try:
+                        self.memory.correct(corr.target_id, corr.corrected_text)
+                    except Exception as ce:
+                        logger.debug(f"Failed to apply correction: {ce}")
+
+            # 5. Queue curiosity exploration
+            if res.open_questions:
+                self.curiosity.enqueue_questions(res.open_questions)
+                # Enqueue curiosity background job
+                self.scheduler.enqueue(
+                    BackgroundJob(
+                        job_id=f"curiosity_{int(time.time()*1000)}",
+                        job_type="curiosity_search",
+                        coro_fn=self.curiosity.explore_next,
+                        priority=5,
+                    )
+                )
+
+        # Enqueue digest job with high priority (priority 10)
+        self.scheduler.enqueue(
+            BackgroundJob(
+                job_id=f"digest_{int(time.time()*1000)}",
+                job_type="digest",
+                coro_fn=_run_digest,
+                priority=10,
+            )
         )
 
     async def _transcribe(self, pcm_bytes: bytes) -> str:
