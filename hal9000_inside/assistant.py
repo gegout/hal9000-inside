@@ -38,6 +38,8 @@ from hal9000_inside.cognition import (
     CuriosityEngine,
     InteroceptionMonitor,
     PredictionEngine,
+    SleepBudget,
+    SleepManager,
     TurnDigestAnalyzer,
 )
 from hal9000_inside.tts import HalPiperTTS
@@ -67,11 +69,14 @@ class Hal9000Assistant:
         llm: Optional[Any] = None,
         adapter: Optional[Any] = None,
         tts: Optional[Any] = None,
+        sleep_after_minutes: Optional[float] = None,
+        sleep_budget: Optional[SleepBudget] = None,
     ):
         self.compute_config = ComputeDeviceConfig(use_nvidia=use_nvidia, use_intel=use_intel)
         self.ui = TerminalUI()
         self.audio_ctrl = HalfDuplexAudioController(cooldown_seconds=0.6)
         self.audio_ctrl.set_auto_mode(auto_mode)
+        self.sleep_after_seconds = (sleep_after_minutes * 60.0) if sleep_after_minutes and sleep_after_minutes > 0 else None
         
         self.capture_device = capture_device
         self.audio_source = audio_source
@@ -107,6 +112,20 @@ class Hal9000Assistant:
         self.prediction = PredictionEngine(memory_store=self.memory)
         self.current_episode_id: Optional[str] = None
         self.last_latency_ms: Optional[float] = None
+
+        self.sleep_manager = SleepManager(
+            memory_store=self.memory,
+            curiosity_engine=self.curiosity,
+            prediction_engine=self.prediction,
+            mcp_client=self.mcp,
+            llm_router=self.router,
+            interoception_monitor=self.interoception,
+            budget=sleep_budget or SleepBudget(),
+            data_dir=getattr(self.memory, "data_dir", None),
+        )
+        self.is_sleeping = False
+        self._sleep_task: Optional[asyncio.Task] = None
+        self._toggle_sleep_event = asyncio.Event()
         
         # Parakeet STT backend
         if adapter is not None:
@@ -194,12 +213,41 @@ class Hal9000Assistant:
         current_audio_buffer = bytearray()
         import collections
         preroll_buffer = collections.deque(maxlen=10)  # 300ms pre-roll at 30ms per frame
+        last_speech_time = time.monotonic()
         last_meter_update = 0.0
 
         try:
             async for frame in capture.stream_frames(frame_samples):
                 if not self.running:
                     break
+
+                # 0. Check toggle sleep event (from keyboard 'S')
+                if self._toggle_sleep_event.is_set():
+                    self._toggle_sleep_event.clear()
+                    if not self.is_sleeping:
+                        current_audio_buffer.clear()
+                        preroll_buffer.clear()
+                        await self.enter_sleep()
+                    else:
+                        await self.wake_from_sleep(capture_source=capture)
+                        last_speech_time = time.monotonic()
+
+                # If asleep, discard any audio frames, do not run VAD or turn processing
+                if self.is_sleeping:
+                    current_audio_buffer.clear()
+                    preroll_buffer.clear()
+                    # Check if sleep background task finished on its own (e.g. budget exhausted)
+                    if self._sleep_task and self._sleep_task.done():
+                        await self.wake_from_sleep(capture_source=capture)
+                        last_speech_time = time.monotonic()
+                    continue
+
+                # Auto-sleep check: if silence duration exceeds sleep_after_seconds
+                if self.sleep_after_seconds and (time.monotonic() - last_speech_time > self.sleep_after_seconds):
+                    current_audio_buffer.clear()
+                    preroll_buffer.clear()
+                    await self.enter_sleep()
+                    continue
 
                 # Half-duplex gating: skip capture if HAL is speaking or in cooldown
                 if not self.audio_ctrl.can_capture():
@@ -221,6 +269,7 @@ class Hal9000Assistant:
                     last_meter_update = now
 
                 if is_speaking:
+                    last_speech_time = time.monotonic()
                     self.scheduler.on_speech_start()
                     if len(current_audio_buffer) == 0:
                         # Prepend pre-roll buffer so starting syllables are never clipped
@@ -240,6 +289,7 @@ class Hal9000Assistant:
 
                 if utterance_finished and len(current_audio_buffer) > 16000 * 2 * 0.4:
                     # Speech turn completed
+                    last_speech_time = time.monotonic()
                     audio_to_transcribe = bytes(current_audio_buffer)
                     current_audio_buffer.clear()
                     preroll_buffer.clear()
@@ -521,8 +571,61 @@ class Hal9000Assistant:
 
         return " ".join(results).strip()
 
+    async def enter_sleep(self):
+        """Enter sleep mode: mute mic, cancel TTS, stop VAD processing, launch sleep background task."""
+        if self.is_sleeping:
+            return
+        self.is_sleeping = True
+        self.audio_ctrl.set_muted(True)
+        self.tts.cancel()
+        self.playback.stop()
+        self.audio_ctrl.notify_playback_stopped()
+        self.vad.reset()
+        self.ui.set_state("SLEEPING")
+
+        def _ui_cb(c_done, c_total, n_added, is_on, sec_left):
+            self.ui.update_sleep_status(
+                curiosity_done=c_done,
+                curiosity_total=c_total,
+                notes_added=n_added,
+                is_online=is_on,
+                seconds_left=sec_left,
+            )
+
+        # Run sleep cycle in background task
+        self._sleep_task = asyncio.create_task(
+            self.sleep_manager.run_sleep_cycle(ui_callback=_ui_cb)
+        )
+
+    async def wake_from_sleep(self, capture_source: Optional[Any] = None):
+        """Wake from sleep: request sleep manager to stop, unmute, discard buffered audio, log summary, return to LISTENING."""
+        if not self.is_sleeping:
+            return
+        self.sleep_manager.request_wake()
+        if self._sleep_task:
+            try:
+                summary = await self._sleep_task
+            except Exception as e:
+                logger.debug(f"Sleep cycle exception: {e}")
+                summary = None
+            self._sleep_task = None
+        else:
+            summary = None
+
+        self.is_sleeping = False
+        self.audio_ctrl.set_muted(False)
+        self.vad.reset()
+
+        if capture_source and hasattr(capture_source, "purge_buffered"):
+            capture_source.purge_buffered()
+
+        if summary:
+            self.ui.show_info(f"Woke from sleep: {summary.format_one_liner()}")
+
+        self.ui.set_state("LISTENING")
+
     def _keyboard_listener(self):
-        """Listens for user commands from stdin (Push-to-Talk, Mute, Cancel, Quit)."""
+        """Listens for user commands from stdin (Push-to-Talk, Mute, Cancel, Sleep, Quit)."""
         import termios
         import tty
         import select
@@ -545,7 +648,14 @@ class Hal9000Assistant:
                     self.running = False
                     self.tts.cancel()
                     self.playback.stop()
+                    if self.is_sleeping:
+                        self.sleep_manager.request_wake()
                     break
+                elif ch in ('s', 'S'):  # Toggle sleep
+                    self._toggle_sleep_event.set()
+                elif self.is_sleeping:
+                    # While asleep, ignore all other keys except Q and S
+                    continue
                 elif ch in ('c', 'C'):  # Cancel
                     self._cancel_current = True
                     self.tts.cancel()

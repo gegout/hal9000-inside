@@ -144,6 +144,10 @@ class HalfDuplexAudioController:
             return False
         return True
 
+    @property
+    def muted(self) -> bool:
+        return self._muted
+
 
 class AudioSink:
     """Abstract interface for audio playback."""
@@ -288,17 +292,27 @@ class WavFileSource(AudioSource):
     """Reads 16-bit mono 16kHz PCM audio from a WAV file and streams frames."""
     def __init__(self, file_path: str, sample_rate: int = 16000, real_time: bool = False):
         import wave
-        self.sample_rate = sample_rate
-        self.real_time = real_time
         with wave.open(file_path, "rb") as wf:
             raw = wf.readframes(wf.getnframes())
             sr = wf.getframerate()
         self.pcm = resample_pcm(raw, sr, sample_rate)
+        self._current_offset = 0
+
+    def purge_buffered(self):
+        """Purge buffered audio."""
+        pass
+
+    def skip_bytes(self, num_bytes: int):
+        """Skip bytes in the audio stream (e.g. while sleeping)."""
+        self._current_offset = min(len(self.pcm), self._current_offset + num_bytes)
 
     async def stream_frames(self, frame_samples: int = 480) -> AsyncGenerator[bytes, None]:
         chunk_size = frame_samples * 2
-        for i in range(0, len(self.pcm), chunk_size):
+        self._current_offset = 0
+        while self._current_offset < len(self.pcm):
+            i = self._current_offset
             chunk = self.pcm[i:i + chunk_size]
+            self._current_offset += chunk_size
             if len(chunk) < chunk_size:
                 chunk = chunk + b"\x00" * (chunk_size - len(chunk))
             if self.real_time:

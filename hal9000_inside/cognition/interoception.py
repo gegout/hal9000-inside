@@ -45,9 +45,14 @@ class InteroceptionMonitor:
 
     def __init__(self):
         self.last_turn_telemetry: Optional[Dict[str, Any]] = None
+        self.last_sleep_report: Optional[str] = None
 
     def record_turn_telemetry(self, telemetry: Dict[str, Any]) -> None:
         self.last_turn_telemetry = telemetry
+
+    def set_sleep_report(self, report: str) -> None:
+        """Store the one-line sleep report to inject on the next turn."""
+        self.last_sleep_report = report.strip() if report else None
 
     def get_system_state(
         self,
@@ -64,6 +69,7 @@ class InteroceptionMonitor:
             "cpu_load": get_cpu_load_1m(),
             "mem_pressure": get_memory_pressure(),
             "last_turn": self.last_turn_telemetry,
+            "last_sleep_report": self.last_sleep_report,
         }
 
     def format_self_state_prompt(
@@ -76,6 +82,11 @@ class InteroceptionMonitor:
     ) -> str:
         """Produce an honest, compact self-state block (< 60 tokens) for system prompt injection."""
         state_parts = []
+        if self.last_sleep_report:
+            state_parts.append(self.last_sleep_report)
+            # Clear after reading so it only appears on the immediate next turn after waking
+            self.last_sleep_report = None
+
         if not connected or route == "local":
             state_parts.append(f"Running local model '{model_id}' (offline/local mode).")
         else:

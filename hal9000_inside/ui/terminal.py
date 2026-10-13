@@ -37,6 +37,7 @@ class TerminalUI:
         "RESPONDING": "🔴",       # Model responding / speaking (HAL 9000 eye)
         "ERROR": "⚠️ ",          # Error
         "IDLE": "⏸️ ",           # Idle / paused
+        "SLEEPING": "😴",       # Sleeping
     }
 
     def __init__(self):
@@ -49,7 +50,7 @@ class TerminalUI:
         print(f"{BOLD}{RED}           HAL 9000 INSIDE - VOICE ASSISTANT          {RESET}")
         print(f"{BOLD}{WHITE}  \"Good afternoon, gentlemen. I am a HAL 9000 computer.\" {RESET}")
         print(f"{BOLD}{RED}======================================================{RESET}")
-        print(f"{DIM}Controls: [Space] Push-to-Talk | [M] Mute | [C] Cancel | [Q] Quit{RESET}\n")
+        print(f"{DIM}Controls: [Space] Push-to-Talk | [M] Mute | [C] Cancel | [S] Sleep | [Q] Quit{RESET}\n")
 
     def make_gauge(self, signal: float, noise_floor: float, is_speaking: bool) -> str:
         """Create a compact mic raw input gauge showing noise vs signal power."""
@@ -91,8 +92,28 @@ class TerminalUI:
         sys.stdout.write(line)
         sys.stdout.flush()
 
+    def update_sleep_status(
+        self,
+        curiosity_done: int = 0,
+        curiosity_total: int = 0,
+        notes_added: int = 0,
+        is_online: bool = False,
+        seconds_left: Optional[float] = None,
+    ):
+        """Render sleeping single line: 😴 Sleeping · curiosity 3/10 · notes +5 · offline · 12:40 left"""
+        conn_str = "online" if is_online else "offline"
+        if seconds_left is not None and seconds_left >= 0:
+            m = int(seconds_left // 60)
+            s = int(seconds_left % 60)
+            time_str = f" · {m:02d}:{s:02d} left"
+        else:
+            time_str = ""
+        line = f"\r\033[K😴 {BOLD}{BLUE}Sleeping{RESET} · curiosity {curiosity_done}/{curiosity_total} · notes +{notes_added} · {conn_str}{time_str}"
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
     def set_state(self, state: str, detail: str = ""):
-        """Update status emoticon when state changes (THINKING, RESPONDING, ERROR)."""
+        """Update status emoticon when state changes (THINKING, RESPONDING, ERROR, SLEEPING)."""
         self.current_state = state.upper()
         icon = self.STATUS_ICONS.get(self.current_state, "●")
         
@@ -104,6 +125,9 @@ class TerminalUI:
         elif self.current_state == "ERROR":
             icon = self.STATUS_ICONS["ERROR"]
             status_desc = f"{RED}Error: {detail}{RESET}"
+        elif self.current_state == "SLEEPING":
+            icon = self.STATUS_ICONS["SLEEPING"]
+            status_desc = f"{BLUE}Sleeping...{RESET}"
         else:
             status_desc = detail
 

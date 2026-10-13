@@ -13,3 +13,16 @@
 ### 3. File-Driven Audio Testing & Abstraction
 - **Problem:** Tests and headless runs cannot rely on ALSA hardware (`arecord` / `aplay`).
 - **Decision:** Introduced `AudioSource` (`ArecordSource`, `WavFileSource`) and `AudioSink` (`AplaySink`, `WavFileSink`, `NullSink`) in `hal9000_inside/audio/manager.py`. CLI supports `--input-wav` and `--output-wav`. Tests run completely hermetic with `FakeSTT`, `FakeEmbedder`, `FakeTTS`, `FakeClock`, and `FakeOpenAIServer`.
+
+## Sleep Mode Decisions
+
+### 1. Offline Mode: Restructure, Never Invent
+- **Rule:** When offline (local model or no network), HAL must strictly avoid hallucinating or inventing new facts during sleep cycles.
+- **Decision:** Steps 2 (endogenous curiosity web search) and 3 (remote model dialogue rehearsal) are skipped entirely when offline. Offline cycles exclusively execute consolidation (merging duplicates, pruning stale memories), reflection (telemetry stats, bounded parameter tuning), and interoception.
+
+### 2. Immediate Mute and Purge on Wake
+- **Problem:** Audio captured while asleep or buffered in pipes could trigger unintended turns upon waking.
+- **Decision:** Entering sleep sets `audio_ctrl.set_muted(True)`, stops VAD, and cancels any running TTS. Waking un-mutes audio, calls `capture.purge_buffered()` to discard all stale audio accumulated during sleep, and returns cleanly to `LISTENING`.
+
+### 3. One-Line Sleep Report Injection
+- **Decision:** On wake, a concise summary is logged (`Slept <X> min, learned <Y> notes, <online/offline the whole time>.`) and stored in `InteroceptionMonitor.last_sleep_report`. On the very next spoken turn, it is injected into the system prompt's self-state block and then cleared.

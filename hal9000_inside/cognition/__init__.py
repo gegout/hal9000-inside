@@ -11,6 +11,7 @@ from hal9000_inside.cognition.digest import (
 from hal9000_inside.cognition.interoception import InteroceptionMonitor
 from hal9000_inside.cognition.prediction import PredictionEngine
 from hal9000_inside.cognition.scheduler import BackgroundJob, CognitiveScheduler
+from hal9000_inside.cognition.sleep import SleepBudget, SleepManager, SleepSummary
 
 __all__ = [
     "AttentionTracker",
@@ -20,6 +21,9 @@ __all__ = [
     "FactToRemember",
     "InteroceptionMonitor",
     "PredictionEngine",
+    "SleepBudget",
+    "SleepManager",
+    "SleepSummary",
     "TurnDigestAnalyzer",
     "TurnDigestResult",
     "UserCorrection",
