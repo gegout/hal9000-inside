@@ -44,6 +44,7 @@ class TerminalUI:
         self.current_state = "LISTENING"
         self._current_user_text = ""
         self._last_line_len = 0
+        self._progress_active = False
 
     def header(self):
         print(f"{BOLD}{RED}======================================================{RESET}")
@@ -148,34 +149,54 @@ class TerminalUI:
         sys.stdout.flush()
 
     def show_progress(self, step: int, total_steps: int, description: str):
-        """Render a single-line loading progress bar during initialization."""
+        """Render a single-line loading progress bar during initialization with description above."""
         bar_len = 24
         ratio = max(0.0, min(1.0, step / float(total_steps)))
         filled = int(ratio * bar_len)
         bar = "█" * filled + "░" * (bar_len - filled)
         pct = int(ratio * 100)
-        line = f"\r\033[K{BOLD}{CYAN}Initializing HAL 9000 [{bar}] {pct:3d}%{RESET} {DIM}({step}/{total_steps}) {description}{RESET}"
-        sys.stdout.write(line)
+
+        # Print step description above the progress bar on a permanent line
+        if self._progress_active:
+            # Clear current progress bar line
+            sys.stdout.write("\r\033[K")
+        sys.stdout.write(f"  {DIM}•{RESET} {description}\n")
+        
+        # Render progress bar on current line
+        bar_line = f"\r\033[K{BOLD}{CYAN}Initializing HAL 9000 [{bar}] {pct:3d}%{RESET} {DIM}({step}/{total_steps}){RESET}"
+        sys.stdout.write(bar_line)
         sys.stdout.flush()
+        self._progress_active = True
+
         if step >= total_steps:
-            sys.stdout.write(f"\r\033[K{BOLD}{GREEN}✔ HAL 9000 ready.{RESET}\n")
+            self._progress_active = False
+            sys.stdout.write(f"\n{BOLD}{GREEN}✔ HAL 9000 ready.{RESET}\n\n")
             sys.stdout.flush()
 
     def show_warning(self, message: str):
         """Prints warning line nicely without breaking layout."""
         icon = self.STATUS_ICONS.get("ERROR", "⚠️ ")
-        sys.stdout.write(f"\r\033[K{icon} {BOLD}{YELLOW}Warning:{RESET} {message}\n")
+        if self._progress_active:
+            sys.stdout.write(f"\r\033[K{icon} {BOLD}{YELLOW}Warning:{RESET} {message}\n")
+        else:
+            sys.stdout.write(f"\r\033[K{icon} {BOLD}{YELLOW}Warning:{RESET} {message}\n")
         sys.stdout.flush()
 
     def show_error(self, message: str):
         """Prints error line."""
         icon = self.STATUS_ICONS["ERROR"]
-        sys.stdout.write(f"\r\033[K{icon} {BOLD}{RED}Error:{RESET} {message}\n")
+        if self._progress_active:
+            sys.stdout.write(f"\r\033[K{icon} {BOLD}{RED}Error:{RESET} {message}\n")
+        else:
+            sys.stdout.write(f"\r\033[K{icon} {BOLD}{RED}Error:{RESET} {message}\n")
         sys.stdout.flush()
 
     def show_info(self, message: str):
         """Prints diagnostic info."""
-        sys.stdout.write(f"\r\033[K{DIM}[INFO] {message}{RESET}\n")
+        if self._progress_active:
+            sys.stdout.write(f"\r\033[K{DIM}[INFO] {message}{RESET}\n")
+        else:
+            sys.stdout.write(f"\r\033[K{DIM}[INFO] {message}{RESET}\n")
         sys.stdout.flush()
 
     def restore(self):

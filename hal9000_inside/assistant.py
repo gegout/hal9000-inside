@@ -29,6 +29,7 @@ from hal9000_inside.audio import (
 )
 from hal9000_inside.hardware import ComputeDeviceConfig, detect_system_gpus
 from hal9000_inside.llm import LLMClient, LLMRouter, HAL9000_SYSTEM_PROMPT
+from hal9000_inside.llm.router import DEFAULT_LOCAL_ENDPOINT, DEFAULT_LOCAL_MODEL
 from hal9000_inside.memory import MemoryStore, MultilingualE5Embedder
 from hal9000_inside.mcp import MCPClientManager
 from hal9000_inside.cognition import (
@@ -86,8 +87,11 @@ class Hal9000Assistant:
         if isinstance(self.llm, LLMRouter):
             self.router = self.llm
         else:
-            self.router = LLMRouter(remote_client=self.llm if not getattr(self.llm, 'is_local', False) else None,
-                                    local_client=self.llm if getattr(self.llm, 'is_local', False) else None)
+            default_local = LLMClient(base_url=DEFAULT_LOCAL_ENDPOINT, model=DEFAULT_LOCAL_MODEL)
+            self.router = LLMRouter(
+                remote_client=self.llm if not getattr(self.llm, 'is_local', False) else None,
+                local_client=self.llm if getattr(self.llm, 'is_local', False) else default_local,
+            )
         if memory is not None:
             self.memory = memory
         else:

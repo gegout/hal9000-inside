@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 # Small instruction model with strong English dialogue and reliable structured output
-DEFAULT_MODEL = "openai/gpt-4o-mini"
-FALLBACK_MODEL = "google/gemini-2.5-flash-lite"
+DEFAULT_MODEL = "google/gemini-2.5-flash-lite"
+FALLBACK_MODEL = "openai/gpt-4o-mini"
 
 CONFIG_PATH = os.path.expanduser("~/.openrouter.config")
 
@@ -189,7 +189,9 @@ class LLMClient:
                             raise RuntimeError(f"OpenRouter Server error: HTTP {resp.status_code}")
                         await asyncio.sleep(1.0 * attempt)
                         continue
-                    resp.raise_for_status()
+                    if resp.is_error:
+                        err_text = resp.text
+                        raise RuntimeError(f"OpenRouter request failed (HTTP {resp.status_code}): {err_text}")
                     data = resp.json()
                     msg = data["choices"][0]["message"]
                     if return_dict or tools:
