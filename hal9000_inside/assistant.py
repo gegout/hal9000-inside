@@ -48,7 +48,11 @@ from hal9000_inside.ui import TerminalUI
 from myna.core import AudioFormat, PcmChunk, SessionConfig, TranscriptionDone
 from myna.testbed.parakeet import ParakeetAdapter
 
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
+# Suppress info logging from submodules during startup so progress bar is clean
+for _noisy in ("hal9000_inside", "mcp", "myna", "httpx", "urllib3"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 FORMAT_16K = AudioFormat(sample_rate_hz=16_000, channels=1, sample_width_bytes=2)
 
 

@@ -191,6 +191,10 @@ def cmd_run(args):
         except Exception:
             pass
 
+    import logging
+    logging.basicConfig(level=logging.WARNING)
+    logging.getLogger().setLevel(logging.WARNING)
+
     from hal9000_inside.assistant import Hal9000Assistant
     
     # Resolve GPU flags

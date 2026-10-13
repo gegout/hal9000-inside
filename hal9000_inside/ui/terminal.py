@@ -148,21 +148,15 @@ class TerminalUI:
         sys.stdout.write(f"{icon} {BOLD}{RED}HAL 9000:{RESET} {text.strip()}\n")
         sys.stdout.flush()
 
-    def show_progress(self, step: int, total_steps: int, description: str):
-        """Render a single-line loading progress bar during initialization with description above."""
+    def show_progress(self, step: int, total_steps: int, description: str = ""):
+        """Render a single-line loading progress bar during initialization without text."""
         bar_len = 24
         ratio = max(0.0, min(1.0, step / float(total_steps)))
         filled = int(ratio * bar_len)
         bar = "█" * filled + "░" * (bar_len - filled)
         pct = int(ratio * 100)
 
-        # Print step description above the progress bar on a permanent line
-        if self._progress_active:
-            # Clear current progress bar line
-            sys.stdout.write("\r\033[K")
-        sys.stdout.write(f"  {DIM}•{RESET} {description}\n")
-        
-        # Render progress bar on current line
+        # Render strictly on a single in-place line
         bar_line = f"\r\033[K{BOLD}{CYAN}Initializing HAL 9000 [{bar}] {pct:3d}%{RESET} {DIM}({step}/{total_steps}){RESET}"
         sys.stdout.write(bar_line)
         sys.stdout.flush()
@@ -170,7 +164,7 @@ class TerminalUI:
 
         if step >= total_steps:
             self._progress_active = False
-            sys.stdout.write(f"\n{BOLD}{GREEN}✔ HAL 9000 ready.{RESET}\n\n")
+            sys.stdout.write(f"\r\033[K{BOLD}{GREEN}✔ HAL 9000 ready.{RESET}\n\n")
             sys.stdout.flush()
 
     def show_warning(self, message: str):
@@ -193,11 +187,9 @@ class TerminalUI:
 
     def show_info(self, message: str):
         """Prints diagnostic info."""
-        if self._progress_active:
+        if not self._progress_active:
             sys.stdout.write(f"\r\033[K{DIM}[INFO] {message}{RESET}\n")
-        else:
-            sys.stdout.write(f"\r\033[K{DIM}[INFO] {message}{RESET}\n")
-        sys.stdout.flush()
+            sys.stdout.flush()
 
     def restore(self):
         """Restores terminal cursor and state."""
