@@ -148,6 +148,10 @@ class HalfDuplexAudioController:
     def muted(self) -> bool:
         return self._muted
 
+    @property
+    def is_playing(self) -> bool:
+        return self._is_playing
+
 
 class AudioSink:
     """Abstract interface for audio playback."""
@@ -296,6 +300,8 @@ class WavFileSource(AudioSource):
             raw = wf.readframes(wf.getnframes())
             sr = wf.getframerate()
         self.pcm = resample_pcm(raw, sr, sample_rate)
+        self.sample_rate = sample_rate
+        self.real_time = real_time
         self._current_offset = 0
 
     def purge_buffered(self):

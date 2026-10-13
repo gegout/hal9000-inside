@@ -99,6 +99,24 @@ class LLMRouter:
             self.remote_errors = max(0, self.remote_errors - 1)
             self.connectivity.is_connected = True
 
+    @property
+    def model(self) -> str:
+        if self.choose_route() == "local" and self.local_client:
+            return self.local_client.model
+        if self.remote_client:
+            return self.remote_client.model
+        if self.local_client:
+            return self.local_client.model
+        return "unknown"
+
+    @property
+    def is_local(self) -> bool:
+        return self.choose_route() == "local"
+
+    @property
+    def is_configured(self) -> bool:
+        return bool((self.remote_client and self.remote_client.is_configured) or (self.local_client and self.local_client.is_configured))
+
     def choose_route(self) -> str:
         """Decide 'remote' or 'local' based on state."""
         if self.force_local:

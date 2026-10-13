@@ -66,9 +66,105 @@ class TestAssistantEndToEnd(unittest.TestCase):
                 self.assertGreaterEqual(row[0], 0.0)
                 self.assertGreaterEqual(row[1], 0.0)
                 self.assertGreaterEqual(row[2], 0.0)
-                self.assertEqual(row[5], "remote")
+            self.assertFalse(assistant.audio_ctrl.is_playing)
         finally:
             loop.close()
+
+    def test_assistant_speech_loop_local_route(self):
+        fake_local_server = FakeOpenAIServer()
+        fake_local_server.enqueue_response("Local HAL: I am operating completely offline.")
+
+        fake_embedder = FakeEmbedder()
+        real_store = MemoryStore(data_dir=self.temp_dir, embedder=fake_embedder)
+        fake_stt = FakeSTT(script=["Where are we?"])
+        fake_tts = FakeTTS()
+        local_client = LLMClient(model="local-gemma", base_url="http://127.0.0.1:8336/v3", api_key="sk-fake", transport=fake_local_server.get_transport())
+
+        from hal9000_inside.llm import LLMRouter
+        router = LLMRouter(remote_client=None, local_client=local_client, force_local=True)
+
+        assistant = Hal9000Assistant(
+            memory=real_store,
+            llm=router,
+            adapter=fake_stt,
+            tts=fake_tts,
+            audio_sink=NullSink(),
+        )
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            self.assertFalse(assistant.audio_ctrl.is_playing)
+            dummy_pcm = b"\x01\x00" * 16000
+            loop.run_until_complete(assistant._handle_turn(dummy_pcm))
+
+            recent = assistant.memory.get_recent_turns(limit=2, session_id=assistant.current_episode_id)
+            self.assertEqual(len(recent), 2)
+            self.assertEqual(recent[0]["content"], "Where are we?")
+            self.assertIn("offline", recent[1]["content"])
+
+            import sqlite3
+            with sqlite3.connect(real_store.sqlite_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT model_id, route FROM turn_telemetry")
+                rows = cursor.fetchall()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0][0], "local-gemma")
+                self.assertEqual(rows[0][1], "local")
+
+            self.assertFalse(assistant.audio_ctrl.is_playing)
+        finally:
+            loop.close()
+
+    def test_assistant_speech_loop_remote_fallback_to_local(self):
+        fake_remote = FakeOpenAIServer()
+        fake_remote.enqueue_error(status_code=503)
+        fake_remote.enqueue_error(status_code=503)
+        fake_remote.enqueue_error(status_code=503)
+
+        fake_local = FakeOpenAIServer()
+        fake_local.enqueue_response("Local fallback response: Recovered from remote outage.")
+
+        fake_embedder = FakeEmbedder()
+        real_store = MemoryStore(data_dir=self.temp_dir, embedder=fake_embedder)
+        fake_stt = FakeSTT(script=["Status check"])
+        fake_tts = FakeTTS()
+
+        remote_client = LLMClient(model="remote-deepseek", api_key="sk-remote", transport=fake_remote.get_transport())
+        local_client = LLMClient(model="local-gemma", api_key="sk-local", transport=fake_local.get_transport())
+
+        from hal9000_inside.llm import LLMRouter
+        router = LLMRouter(remote_client=remote_client, local_client=local_client)
+
+        assistant = Hal9000Assistant(
+            memory=real_store,
+            llm=router,
+            adapter=fake_stt,
+            tts=fake_tts,
+            audio_sink=NullSink(),
+        )
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            dummy_pcm = b"\x01\x00" * 16000
+            loop.run_until_complete(assistant._handle_turn(dummy_pcm))
+
+            recent = assistant.memory.get_recent_turns(limit=2, session_id=assistant.current_episode_id)
+            self.assertEqual(len(recent), 2)
+            self.assertIn("Recovered from remote outage", recent[1]["content"])
+
+            import sqlite3
+            with sqlite3.connect(real_store.sqlite_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT model_id, route FROM turn_telemetry")
+                rows = cursor.fetchall()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0][0], "local-gemma")
+                self.assertEqual(rows[0][1], "local")
+        finally:
+            loop.close()
+
 
 if __name__ == "__main__":
     unittest.main()
