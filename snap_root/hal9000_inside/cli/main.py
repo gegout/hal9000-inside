@@ -191,6 +191,10 @@ def cmd_run(args):
         except Exception:
             pass
 
+    import logging
+    logging.basicConfig(level=logging.WARNING)
+    logging.getLogger().setLevel(logging.WARNING)
+
     from hal9000_inside.assistant import Hal9000Assistant
     
     # Resolve GPU flags
@@ -206,6 +210,16 @@ def cmd_run(args):
     elif getattr(args, "no_intel", False):
         use_intel = False
 
+    from hal9000_inside.audio import WavFileSource, WavFileSink
+
+    audio_source = None
+    if getattr(args, "input_wav", None):
+        audio_source = WavFileSource(args.input_wav, real_time=False)
+
+    audio_sink = None
+    if getattr(args, "output_wav", None):
+        audio_sink = WavFileSink(args.output_wav)
+
     assistant = Hal9000Assistant(
         capture_device=args.device,
         model_override=args.model,
@@ -213,6 +227,9 @@ def cmd_run(args):
         auto_mode=not args.push_to_talk,
         use_nvidia=use_nvidia,
         use_intel=use_intel,
+        audio_source=audio_source,
+        audio_sink=audio_sink,
+        sleep_after_minutes=getattr(args, "sleep_after", None),
     )
     try:
         asyncio.run(assistant.run())
@@ -224,6 +241,51 @@ def cmd_run(args):
                 termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, orig_termios)
             except Exception:
                 pass
+    return 0
+
+
+def cmd_sleep(args):
+    """Run sleep mode headless, no audio devices opened, then exit."""
+    from hal9000_inside.cognition import SleepBudget, SleepManager
+    from hal9000_inside.memory import MemoryStore, MultilingualE5Embedder
+    from hal9000_inside.llm import LLMClient, LLMRouter
+    from hal9000_inside.mcp import MCPClientManager
+    from hal9000_inside.hardware import ComputeDeviceConfig
+    from hal9000_inside.cognition import CuriosityEngine, PredictionEngine, InteroceptionMonitor
+
+    duration_min = float(getattr(args, "duration", 10.0))
+    print(f"HAL 9000 entering headless sleep mode for {duration_min} minutes...")
+
+    compute_cfg = ComputeDeviceConfig()
+    embedder_providers = compute_cfg.get_onnx_providers(prefer_gpu=False)
+    try:
+        embedder = MultilingualE5Embedder(providers=embedder_providers)
+    except Exception:
+        embedder = None
+
+    data_dir = getattr(args, "data_dir", None)
+    memory = MemoryStore(data_dir=data_dir, embedder=embedder)
+    llm = LLMClient()
+    router = LLMRouter(remote_client=llm if not getattr(llm, 'is_local', False) else None)
+    mcp = MCPClientManager()
+    curiosity = CuriosityEngine(memory_store=memory, mcp_client=mcp, llm_client=router)
+    prediction = PredictionEngine(memory_store=memory)
+    interoception = InteroceptionMonitor()
+
+    budget = SleepBudget(max_minutes=duration_min)
+    sleep_mgr = SleepManager(
+        memory_store=memory,
+        curiosity_engine=curiosity,
+        prediction_engine=prediction,
+        mcp_client=mcp,
+        llm_router=router,
+        interoception_monitor=interoception,
+        budget=budget,
+        data_dir=memory.data_dir,
+    )
+
+    summary = asyncio.run(sleep_mgr.run_sleep_cycle())
+    print(f"Sleep complete: {summary.format_one_liner()}")
     return 0
 
 
@@ -254,12 +316,20 @@ def main():
     mem_parser.add_argument("--text", help="Memory content")
     mem_parser.add_argument("--category", default="fact", help="Memory category")
 
+    # sleep
+    sleep_parser = subparsers.add_parser("sleep", help="Run sleep mode headless, no audio devices opened, then exit")
+    sleep_parser.add_argument("--for", dest="duration", type=float, default=10.0, help="Duration in minutes to sleep")
+    sleep_parser.add_argument("--data-dir", help="Custom data directory for SQLite and Qdrant")
+
     # run
     run_parser = subparsers.add_parser("run", help="Start voice assistant interactive loop")
     run_parser.add_argument("--push-to-talk", action="store_true", help="Enable push-to-talk instead of auto conversation mode")
     run_parser.add_argument("--device", help="ALSA capture device name (e.g. hw:CARD=Talk,DEV=0 or default)")
     run_parser.add_argument("--model", help="OpenAI-compatible model ID override (e.g. gemma4-e4b-ov)")
     run_parser.add_argument("--endpoint", help="OpenAI-compatible base URL override (e.g. http://127.0.0.1:8336/v3)")
+    run_parser.add_argument("--input-wav", help="Path to input WAV file to drive session from file instead of microphone")
+    run_parser.add_argument("--output-wav", help="Path to output WAV file to record assistant speech instead of speaker")
+    run_parser.add_argument("--sleep-after", type=float, default=None, help="Auto-enter sleep mode after specified minutes of silence")
 
     # GPU options
     nvidia_group = run_parser.add_mutually_exclusive_group()
@@ -280,6 +350,8 @@ def main():
         sys.exit(cmd_mcp(args))
     elif args.command == "memory":
         sys.exit(cmd_memory(args))
+    elif args.command == "sleep":
+        sys.exit(cmd_sleep(args))
     elif args.command == "run":
         sys.exit(cmd_run(args))
     else:

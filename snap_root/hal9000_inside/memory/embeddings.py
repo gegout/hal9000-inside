@@ -10,7 +10,7 @@ Enforces:
 import json
 import logging
 import os
-from typing import List, Union
+from typing import List, Optional, Union
 import numpy as np
 import onnxruntime as ort
 from tokenizers import Tokenizer

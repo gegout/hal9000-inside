@@ -165,6 +165,62 @@ class TestAssistantEndToEnd(unittest.TestCase):
         finally:
             loop.close()
 
+    def test_assistant_tool_call_memory_search_in_process(self):
+        """Verify LLM tool calls targeting memory_search execute directly in-process without Qdrant locking."""
+        import json
+        fake_server = FakeOpenAIServer()
+        # 1st response: model issues tool_call for memory_search
+        tool_call = {
+            "id": "call_mem_1",
+            "type": "function",
+            "function": {
+                "name": "memory_search",
+                "arguments": json.dumps({"query": "user preference"}),
+            }
+        }
+        fake_server.enqueue_response(None, tool_calls=[tool_call])
+        # 2nd response: final response following tool execution
+        fake_server.enqueue_response("I have found your preference in memory.")
+
+        fake_embedder = FakeEmbedder()
+        real_store = MemoryStore(data_dir=self.temp_dir, embedder=fake_embedder)
+        real_store.remember("The user prefers tea over coffee.", category="preference")
+
+        fake_stt = FakeSTT(script=["Do you remember what I like?"])
+        fake_tts = FakeTTS()
+        fake_llm = LLMClient(api_key="sk-fake-key", transport=fake_server.get_transport())
+
+        assistant = Hal9000Assistant(
+            memory=real_store,
+            llm=fake_llm,
+            adapter=fake_stt,
+            tts=fake_tts,
+            audio_sink=NullSink(),
+        )
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            dummy_pcm = b"\x01\x00" * 16000
+            loop.run_until_complete(assistant._handle_turn(dummy_pcm))
+
+            recent = assistant.memory.get_recent_turns(limit=2, session_id=assistant.current_episode_id)
+            self.assertEqual(len(recent), 2)
+            self.assertIn("found your preference in memory", recent[1]["content"])
+
+            # Telemetry confirms tool call count = 1
+            import sqlite3
+            with sqlite3.connect(real_store.sqlite_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT tool_calls, errors FROM turn_telemetry")
+                rows = cursor.fetchall()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0][0], 1)
+                self.assertEqual(rows[0][1], 0)
+        finally:
+            loop.close()
+
 
 if __name__ == "__main__":
     unittest.main()
+

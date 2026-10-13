@@ -44,33 +44,53 @@ def get_browser() -> PuppeteerBrowser:
 @mcp_server.tool(name="memory_search", description="Search HAL 9000's embedded memory for user preferences, facts, past statements, and context using semantic retrieval.")
 def memory_search(query: str, limit: int = 5) -> str:
     """Semantic retrieval from HAL 9000 memory."""
-    mem = get_memory_store()
-    results = mem.search(query, limit=limit)
-    return json.dumps(results, indent=2)
+    try:
+        mem = get_memory_store()
+        results = mem.search(query, limit=limit)
+        return json.dumps(results, indent=2)
+    except RuntimeError as e:
+        if "locked by another running process" in str(e) or "already accessed" in str(e):
+            return json.dumps({"error": "Memory store is currently locked by active assistant process."})
+        raise
 
 
 @mcp_server.tool(name="memory_inspect_all", description="Inspect all stored long-term facts, relationships, and user preferences stored in HAL 9000 memory.")
 def memory_inspect_all() -> str:
     """List all stored active memories."""
-    mem = get_memory_store()
-    results = mem.inspect_all()
-    return json.dumps(results, indent=2)
+    try:
+        mem = get_memory_store()
+        results = mem.inspect_all()
+        return json.dumps(results, indent=2)
+    except RuntimeError as e:
+        if "locked by another running process" in str(e) or "already accessed" in str(e):
+            return json.dumps({"error": "Memory store is currently locked by active assistant process."})
+        raise
 
 
 @mcp_server.tool(name="memory_get_recent_dialogue", description="Retrieve recent dialogue turns between user and HAL 9000 for conversation continuity.")
 def memory_get_recent_dialogue(limit: int = 10) -> str:
     """Retrieve recent conversation turns."""
-    mem = get_memory_store()
-    turns = mem.get_recent_turns(limit=limit)
-    return json.dumps(turns, indent=2)
+    try:
+        mem = get_memory_store()
+        turns = mem.get_recent_turns(limit=limit)
+        return json.dumps(turns, indent=2)
+    except RuntimeError as e:
+        if "locked by another running process" in str(e) or "already accessed" in str(e):
+            return json.dumps({"error": "Memory store is currently locked by active assistant process."})
+        raise
 
 
 @mcp_server.tool(name="memory_remember", description="Store a new fact, preference, or learned knowledge into HAL 9000's persistent memory.")
 def memory_remember(text: str, category: str = "knowledge") -> str:
     """Add new fact/knowledge to memory."""
-    mem = get_memory_store()
-    mem_id = mem.remember(text, category=category)
-    return json.dumps({"status": "stored", "memory_id": mem_id})
+    try:
+        mem = get_memory_store()
+        mem_id = mem.remember(text, category=category)
+        return json.dumps({"status": "stored", "memory_id": mem_id})
+    except RuntimeError as e:
+        if "locked by another running process" in str(e) or "already accessed" in str(e):
+            return json.dumps({"error": "Memory store is currently locked by active assistant process."})
+        raise
 
 
 @mcp_server.tool(name="web_search_wikipedia", description="Search Wikipedia using Puppeteer headless browser and extract readable text knowledge.")

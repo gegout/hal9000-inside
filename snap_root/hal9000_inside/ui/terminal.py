@@ -37,19 +37,21 @@ class TerminalUI:
         "RESPONDING": "🔴",       # Model responding / speaking (HAL 9000 eye)
         "ERROR": "⚠️ ",          # Error
         "IDLE": "⏸️ ",           # Idle / paused
+        "SLEEPING": "😴",       # Sleeping
     }
 
     def __init__(self):
         self.current_state = "LISTENING"
         self._current_user_text = ""
         self._last_line_len = 0
+        self._progress_active = False
 
     def header(self):
         print(f"{BOLD}{RED}======================================================{RESET}")
         print(f"{BOLD}{RED}           HAL 9000 INSIDE - VOICE ASSISTANT          {RESET}")
         print(f"{BOLD}{WHITE}  \"Good afternoon, gentlemen. I am a HAL 9000 computer.\" {RESET}")
         print(f"{BOLD}{RED}======================================================{RESET}")
-        print(f"{DIM}Controls: [Space] Push-to-Talk | [M] Mute | [C] Cancel | [Q] Quit{RESET}\n")
+        print(f"{DIM}Controls: [Space] Push-to-Talk | [M] Mute | [C] Cancel | [S] Sleep | [Q] Quit{RESET}\n")
 
     def make_gauge(self, signal: float, noise_floor: float, is_speaking: bool) -> str:
         """Create a compact mic raw input gauge showing noise vs signal power."""
@@ -91,8 +93,28 @@ class TerminalUI:
         sys.stdout.write(line)
         sys.stdout.flush()
 
+    def update_sleep_status(
+        self,
+        curiosity_done: int = 0,
+        curiosity_total: int = 0,
+        notes_added: int = 0,
+        is_online: bool = False,
+        seconds_left: Optional[float] = None,
+    ):
+        """Render sleeping single line: 😴 Sleeping · curiosity 3/10 · notes +5 · offline · 12:40 left"""
+        conn_str = "online" if is_online else "offline"
+        if seconds_left is not None and seconds_left >= 0:
+            m = int(seconds_left // 60)
+            s = int(seconds_left % 60)
+            time_str = f" · {m:02d}:{s:02d} left"
+        else:
+            time_str = ""
+        line = f"\r\033[K😴 {BOLD}{BLUE}Sleeping{RESET} · curiosity {curiosity_done}/{curiosity_total} · notes +{notes_added} · {conn_str}{time_str}"
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
     def set_state(self, state: str, detail: str = ""):
-        """Update status emoticon when state changes (THINKING, RESPONDING, ERROR)."""
+        """Update status emoticon when state changes (THINKING, RESPONDING, ERROR, SLEEPING)."""
         self.current_state = state.upper()
         icon = self.STATUS_ICONS.get(self.current_state, "●")
         
@@ -104,6 +126,9 @@ class TerminalUI:
         elif self.current_state == "ERROR":
             icon = self.STATUS_ICONS["ERROR"]
             status_desc = f"{RED}Error: {detail}{RESET}"
+        elif self.current_state == "SLEEPING":
+            icon = self.STATUS_ICONS["SLEEPING"]
+            status_desc = f"{BLUE}Sleeping...{RESET}"
         else:
             status_desc = detail
 
@@ -123,36 +148,48 @@ class TerminalUI:
         sys.stdout.write(f"{icon} {BOLD}{RED}HAL 9000:{RESET} {text.strip()}\n")
         sys.stdout.flush()
 
-    def show_progress(self, step: int, total_steps: int, description: str):
-        """Render a single-line loading progress bar during initialization."""
+    def show_progress(self, step: int, total_steps: int, description: str = ""):
+        """Render a single-line loading progress bar during initialization without text."""
         bar_len = 24
         ratio = max(0.0, min(1.0, step / float(total_steps)))
         filled = int(ratio * bar_len)
         bar = "█" * filled + "░" * (bar_len - filled)
         pct = int(ratio * 100)
-        line = f"\r\033[K{BOLD}{CYAN}Initializing HAL 9000 [{bar}] {pct:3d}%{RESET} {DIM}({step}/{total_steps}) {description}{RESET}"
-        sys.stdout.write(line)
+
+        # Render strictly on a single in-place line
+        bar_line = f"\r\033[K{BOLD}{CYAN}Initializing HAL 9000 [{bar}] {pct:3d}%{RESET} {DIM}({step}/{total_steps}){RESET}"
+        sys.stdout.write(bar_line)
         sys.stdout.flush()
+        self._progress_active = True
+
         if step >= total_steps:
-            sys.stdout.write(f"\r\033[K{BOLD}{GREEN}✔ HAL 9000 ready.{RESET}\n")
+            self._progress_active = False
+            sys.stdout.write(f"\r\033[K{BOLD}{GREEN}✔ HAL 9000 ready.{RESET}\n\n")
             sys.stdout.flush()
 
     def show_warning(self, message: str):
         """Prints warning line nicely without breaking layout."""
         icon = self.STATUS_ICONS.get("ERROR", "⚠️ ")
-        sys.stdout.write(f"\r\033[K{icon} {BOLD}{YELLOW}Warning:{RESET} {message}\n")
+        if self._progress_active:
+            sys.stdout.write(f"\r\033[K{icon} {BOLD}{YELLOW}Warning:{RESET} {message}\n")
+        else:
+            sys.stdout.write(f"\r\033[K{icon} {BOLD}{YELLOW}Warning:{RESET} {message}\n")
         sys.stdout.flush()
 
     def show_error(self, message: str):
         """Prints error line."""
         icon = self.STATUS_ICONS["ERROR"]
-        sys.stdout.write(f"\r\033[K{icon} {BOLD}{RED}Error:{RESET} {message}\n")
+        if self._progress_active:
+            sys.stdout.write(f"\r\033[K{icon} {BOLD}{RED}Error:{RESET} {message}\n")
+        else:
+            sys.stdout.write(f"\r\033[K{icon} {BOLD}{RED}Error:{RESET} {message}\n")
         sys.stdout.flush()
 
     def show_info(self, message: str):
         """Prints diagnostic info."""
-        sys.stdout.write(f"\r\033[K{DIM}[INFO] {message}{RESET}\n")
-        sys.stdout.flush()
+        if not self._progress_active:
+            sys.stdout.write(f"\r\033[K{DIM}[INFO] {message}{RESET}\n")
+            sys.stdout.flush()
 
     def restore(self):
         """Restores terminal cursor and state."""

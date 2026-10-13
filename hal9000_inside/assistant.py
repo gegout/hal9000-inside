@@ -415,7 +415,7 @@ class Hal9000Assistant:
 
                     self.ui.show_info(f"Using tool: {fn_name}...")
                     try:
-                        tool_res = await self.mcp.call_tool(fn_name, fn_args)
+                        tool_res = await self._execute_tool(fn_name, fn_args)
                     except Exception as te:
                         tool_res = f"Tool execution failed: {te}"
 
@@ -631,6 +631,29 @@ class Hal9000Assistant:
             self.ui.show_info(f"Woke from sleep: {summary.format_one_liner()}")
 
         self.ui.set_state("LISTENING")
+
+    async def _execute_tool(self, name: str, arguments: Dict[str, Any]) -> str:
+        """Execute a tool, dispatching internal memory tools in-process to avoid Qdrant locking."""
+        import json
+        if name == "memory_search":
+            query = arguments.get("query", "")
+            limit = int(arguments.get("limit", 5))
+            results = self.memory.search(query, limit=limit)
+            return json.dumps(results, indent=2)
+        elif name == "memory_inspect_all":
+            results = self.memory.inspect_all()
+            return json.dumps(results, indent=2)
+        elif name == "memory_get_recent_dialogue":
+            limit = int(arguments.get("limit", 10))
+            turns = self.memory.get_recent_turns(limit=limit)
+            return json.dumps(turns, indent=2)
+        elif name == "memory_remember":
+            text = arguments.get("text", "")
+            category = arguments.get("category", "knowledge")
+            mem_id = self.memory.remember(text, category=category)
+            return json.dumps({"status": "stored", "memory_id": mem_id})
+        else:
+            return await self.mcp.call_tool(name, arguments)
 
     def _keyboard_listener(self):
         """Listens for user commands from stdin (Push-to-Talk, Mute, Cancel, Sleep, Quit)."""

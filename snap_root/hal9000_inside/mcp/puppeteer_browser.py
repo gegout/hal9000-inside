@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -17,9 +18,23 @@ class PuppeteerBrowser:
     """Manages headless browser operations using Puppeteer and Google Chrome."""
 
     def __init__(self):
-        self.node_path = shutil.which("node") or "/home/cgegout/.local/bin/node"
-        self.chrome_path = "/usr/bin/google-chrome"
-        self.node_modules = "/home/cgegout/.local/node_modules"
+        user_home = Path.home()
+        self.node_path = (
+            os.environ.get("NODE_BIN")
+            or shutil.which("node")
+            or str(user_home / ".local" / "bin" / "node")
+        )
+        self.chrome_path = (
+            os.environ.get("CHROME_BIN")
+            or shutil.which("google-chrome")
+            or shutil.which("chromium")
+            or shutil.which("chromium-browser")
+            or "/usr/bin/google-chrome"
+        )
+        self.node_modules = (
+            os.environ.get("NODE_PATH")
+            or str(user_home / ".local" / "node_modules")
+        )
 
     async def fetch_url(self, url: str) -> Dict[str, Any]:
         """Fetch and extract readable text from a URL using headless Chrome."""
