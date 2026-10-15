@@ -107,6 +107,25 @@ class FakeOpenAIServer:
             sse_content = "".join(lines).encode("utf-8")
             return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=sse_content)
 
+        if req_body.get("stream"):
+            # Request was streaming, but normal completion response was enqueued. Convert to SSE chunks.
+            content = ""
+            if isinstance(resp_data, dict) and "choices" in resp_data:
+                msg = resp_data["choices"][0].get("message", {})
+                content = msg.get("content", "")
+            lines = []
+            if content:
+                chunk = {
+                    "id": "fake-stream",
+                    "object": "chat.completion.chunk",
+                    "created": 1700000000,
+                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": "stop"}],
+                }
+                lines.append(f"data: {json.dumps(chunk)}\n\n")
+            lines.append("data: [DONE]\n\n")
+            sse_content = "".join(lines).encode("utf-8")
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, content=sse_content)
+
         return httpx.Response(200, json=resp_data)
 
     def get_transport(self) -> httpx.MockTransport:

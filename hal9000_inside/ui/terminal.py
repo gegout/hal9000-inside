@@ -100,8 +100,9 @@ class TerminalUI:
         notes_added: int = 0,
         is_online: bool = False,
         seconds_left: Optional[float] = None,
+        dream: Optional[str] = None,
     ):
-        """Render sleeping single line: 😴 Sleeping · curiosity 3/10 · notes +5 · offline · 12:40 left"""
+        """Render sleeping single line: 😴 Sleeping · curiosity 3/10 · notes +5 · dreaming: "..." · offline · 12:40 left"""
         conn_str = "online" if is_online else "offline"
         if seconds_left is not None and seconds_left >= 0:
             m = int(seconds_left // 60)
@@ -109,7 +110,18 @@ class TerminalUI:
             time_str = f" · {m:02d}:{s:02d} left"
         else:
             time_str = ""
-        line = f"\r\033[K😴 {BOLD}{BLUE}Sleeping{RESET} · curiosity {curiosity_done}/{curiosity_total} · notes +{notes_added} · {conn_str}{time_str}"
+
+        dream_str = ""
+        if dream:
+            clean_dream = " ".join(dream.split()).strip()
+            # If dream is an inquiry or discovery text, keep it concise
+            if clean_dream.startswith("Discovery regarding '"):
+                clean_dream = clean_dream[21:].split("'")[0]
+            if len(clean_dream) > 30:
+                clean_dream = clean_dream[:27] + "..."
+            dream_str = f" · {MAGENTA}dreaming: \"{clean_dream}\"{RESET}"
+
+        line = f"\r\033[K😴 {BOLD}{BLUE}Sleeping{RESET} · curiosity {curiosity_done}/{curiosity_total} · notes +{notes_added}{dream_str} · {conn_str}{time_str}"
         sys.stdout.write(line)
         sys.stdout.flush()
 

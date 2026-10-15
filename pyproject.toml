@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hal9000-inside"
-version = "0.2.5"
+version = "0.3.2"
 description = "HAL 9000 Inside - Ubuntu Voice Assistant"
 readme = "README.md"
 license = {text = "AGPL-3.0"}
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "piper-tts",
     "onnxruntime",
@@ -20,6 +20,8 @@ dependencies = [
     "pydantic",
     "qdrant-client",
     "mcp",
+    "free-search-mcp==0.13.1",
+    "selectolax<1.0.0",
 ]
 
 [project.scripts]

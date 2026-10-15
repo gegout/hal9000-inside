@@ -10,6 +10,7 @@ Schema v2 supports:
 - multi-factor retrieval: cosine * salience * recency with access_count tracking
 """
 
+import contextlib
 import datetime
 import json
 import logging
@@ -17,7 +18,7 @@ import math
 import os
 import sqlite3
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
@@ -54,9 +55,23 @@ class MemoryStore:
         self._init_sqlite()
         self._init_qdrant()
 
+    @contextlib.contextmanager
+    def _connect_sqlite(self) -> Generator[sqlite3.Connection, None, None]:
+        """Open a SQLite connection with timeout and guaranteed close to prevent FD leaks."""
+        os.makedirs(self.data_dir, exist_ok=True, mode=0o700)
+        conn = sqlite3.connect(self.sqlite_path, timeout=15.0)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        try:
+            yield conn
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def _init_sqlite(self):
         """Initialise SQLite tables and run migrations if needed."""
-        with sqlite3.connect(self.sqlite_path) as conn:
+        with self._connect_sqlite() as conn:
             cursor = conn.cursor()
 
             # Schema version table
@@ -190,7 +205,7 @@ class MemoryStore:
         """Start a new episode record."""
         ep_id = episode_id or str(uuid.uuid4())
         ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        with sqlite3.connect(self.sqlite_path) as conn:
+        with self._connect_sqlite() as conn:
             conn.execute(
                 "INSERT INTO episodes (id, start_time, topic_summary) VALUES (?, ?, ?)",
                 (ep_id, ts, topic_summary),
@@ -201,7 +216,7 @@ class MemoryStore:
     def end_episode(self, episode_id: str, topic_summary: Optional[str] = None):
         """Finalize an episode with end time and summary."""
         ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        with sqlite3.connect(self.sqlite_path) as conn:
+        with self._connect_sqlite() as conn:
             if topic_summary:
                 conn.execute(
                     "UPDATE episodes SET end_time = ?, topic_summary = ? WHERE id = ?",
@@ -218,7 +233,7 @@ class MemoryStore:
         """Record a single conversational turn in SQLite."""
         turn_id = str(uuid.uuid4())
         ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        with sqlite3.connect(self.sqlite_path) as conn:
+        with self._connect_sqlite() as conn:
             conn.execute(
                 "INSERT INTO turns (id, timestamp, role, content, session_id) VALUES (?, ?, ?, ?, ?)",
                 (turn_id, ts, role, content, session_id),
@@ -247,7 +262,7 @@ class MemoryStore:
         """Record detailed telemetry for an assistant turn."""
         telemetry_id = str(uuid.uuid4())
         ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        with sqlite3.connect(self.sqlite_path) as conn:
+        with self._connect_sqlite() as conn:
             conn.execute("""
                 INSERT INTO turn_telemetry (
                     id, turn_id, timestamp, stt_ms, retrieval_ms, llm_ms,
@@ -264,14 +279,24 @@ class MemoryStore:
             conn.commit()
         return telemetry_id
 
-    def get_recent_turns(self, limit: int = 6, session_id: str = "default") -> List[Dict[str, str]]:
-        """Retrieve recent dialogue turns for follow-up and pronoun resolution."""
-        with sqlite3.connect(self.sqlite_path) as conn:
+    def get_recent_turns(self, limit: int = 6, session_id: Optional[str] = None) -> List[Dict[str, str]]:
+        """Retrieve recent dialogue turns for follow-up and pronoun resolution.
+        
+        If session_id is provided, filters to that session. If session_id is None,
+        retrieves the most recent authoritative dialogue turns regardless of session.
+        """
+        with self._connect_sqlite() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT role, content FROM turns WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
-                (session_id, limit),
-            )
+            if session_id:
+                cursor.execute(
+                    "SELECT role, content FROM turns WHERE session_id = ? ORDER BY timestamp DESC LIMIT ?",
+                    (session_id, limit),
+                )
+            else:
+                cursor.execute(
+                    "SELECT role, content FROM turns ORDER BY timestamp DESC LIMIT ?",
+                    (limit,),
+                )
             rows = cursor.fetchall()
             return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
@@ -320,7 +345,7 @@ class MemoryStore:
         )
 
         # 3. Store in SQLite
-        with sqlite3.connect(self.sqlite_path) as conn:
+        with self._connect_sqlite() as conn:
             conn.execute("""
                 INSERT INTO memories (
                     id, created_at, updated_at, text, category, source_turn_id, is_active,
@@ -417,7 +442,7 @@ class MemoryStore:
         # Update access stats for returned hits
         if top_hits:
             hit_ids_to_update = [h["id"] for h in top_hits]
-            with sqlite3.connect(self.sqlite_path) as conn:
+            with self._connect_sqlite() as conn:
                 for hid in hit_ids_to_update:
                     conn.execute(
                         "UPDATE memories SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?",
@@ -434,7 +459,7 @@ class MemoryStore:
 
         # Retrieve existing metadata
         existing_meta = {}
-        with sqlite3.connect(self.sqlite_path) as conn:
+        with self._connect_sqlite() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT category, created_at, provenance, model_id, confidence, salience,
@@ -488,7 +513,7 @@ class MemoryStore:
             collection_name=COLLECTION_NAME,
             points_selector=[mem_id],
         )
-        with sqlite3.connect(self.sqlite_path) as conn:
+        with self._connect_sqlite() as conn:
             conn.execute("DELETE FROM memories WHERE id = ?", (mem_id,))
             conn.commit()
         return True
@@ -500,7 +525,7 @@ class MemoryStore:
             collection_name=COLLECTION_NAME,
             vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE),
         )
-        with sqlite3.connect(self.sqlite_path) as conn:
+        with self._connect_sqlite() as conn:
             conn.execute("DELETE FROM memories")
             conn.execute("DELETE FROM turns")
             conn.execute("DELETE FROM episodes")
@@ -509,7 +534,7 @@ class MemoryStore:
 
     def inspect_all(self) -> List[Dict[str, Any]]:
         """List all active memories with v2 fields."""
-        with sqlite3.connect(self.sqlite_path) as conn:
+        with self._connect_sqlite() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT id, text, category, created_at, updated_at, provenance, confidence, salience, access_count
@@ -530,3 +555,13 @@ class MemoryStore:
                 }
                 for r in rows
             ]
+
+    def close(self):
+        """Release underlying database and index resources."""
+        if hasattr(self, "qdrant") and self.qdrant:
+            try:
+                self.qdrant.close()
+            except Exception:
+                pass
+            self.qdrant = None
+

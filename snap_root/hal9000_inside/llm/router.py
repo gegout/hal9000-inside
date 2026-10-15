@@ -76,6 +76,7 @@ class LLMRouter:
         first_audio_deadline_seconds: float = 8.0,
         force_local: bool = False,
         force_remote: bool = False,
+        cooldown_turns: int = 2,
     ):
         self.remote_client = remote_client
         self.local_client = local_client
@@ -83,21 +84,47 @@ class LLMRouter:
         self.first_audio_deadline = first_audio_deadline_seconds
         self.force_local = force_local
         self.force_remote = force_remote
+        self.cooldown_turns = cooldown_turns
 
         self.remote_latencies: List[float] = []
         self.remote_errors: int = 0
         self.max_history = 10
 
-    def record_remote_result(self, latency_ms: float, error: bool = False):
+        # Unreachable state & cooldown management
+        self.is_remote_unreachable: bool = False
+        self.cooldown_remaining: int = 0
+        self.retry_in_progress: bool = False
+        self._retry_lock = asyncio.Lock()
+        self._just_fell_back: bool = False
+        self.last_remote_error: Optional[Exception] = None
+        self.last_local_error: Optional[Exception] = None
+
+    def record_remote_result(self, latency_ms: float, error: bool = False, unreachable: bool = False):
         self.remote_latencies.append(latency_ms)
         if len(self.remote_latencies) > self.max_history:
             self.remote_latencies.pop(0)
-        if error:
+        if error or unreachable:
             self.remote_errors += 1
             self.connectivity.is_connected = False
+            if unreachable:
+                self.is_remote_unreachable = True
+                self.cooldown_remaining = self.cooldown_turns
+                self._just_fell_back = True
         else:
             self.remote_errors = max(0, self.remote_errors - 1)
             self.connectivity.is_connected = True
+            self.is_remote_unreachable = False
+            self.cooldown_remaining = 0
+            self._just_fell_back = False
+
+    def record_turn_completed(self, route_used: str):
+        """Call after an interaction turn finishes to decrement cooldown when routing locally."""
+        if self._just_fell_back:
+            self._just_fell_back = False
+            return
+        if self.is_remote_unreachable and self.cooldown_remaining > 0 and route_used == "local":
+            self.cooldown_remaining -= 1
+            logger.info(f"Cooldown interaction completed. Turns remaining before retry: {self.cooldown_remaining}")
 
     @property
     def model(self) -> str:
@@ -118,17 +145,22 @@ class LLMRouter:
         return bool((self.remote_client and self.remote_client.is_configured) or (self.local_client and self.local_client.is_configured))
 
     def choose_route(self) -> str:
-        """Decide 'remote' or 'local' based on state."""
+        """Decide 'remote' or 'local' based on state, cooldown, and connectivity."""
         if self.force_local:
             return "local"
         if self.force_remote:
             return "remote"
         if not self.remote_client or not self.remote_client.is_configured:
             return "local"
-        if not self.connectivity.is_connected:
+        # If in unreachable cooldown, stay local
+        if self.is_remote_unreachable and self.cooldown_remaining > 0:
             return "local"
-        # If last 3 turns failed, route locally
-        if self.remote_errors >= 3:
+        # If a retry is already in progress, prevent concurrent retries
+        if self.retry_in_progress:
+            return "local"
+        if not self.connectivity.is_connected and not self.is_remote_unreachable:
+            return "local"
+        if self.remote_errors >= 3 and not (self.is_remote_unreachable and self.cooldown_remaining == 0):
             return "local"
         return "remote"
 
@@ -137,13 +169,31 @@ class LLMRouter:
         messages: List[Dict[str, str]],
         tools: Optional[List[Dict[str, Any]]] = None,
         return_dict: bool = False,
-        max_tokens: int = 256,
+        max_tokens: int = 1024,
+        on_fallback: Optional[Any] = None,
     ) -> tuple[Any, str, str]:
         """Generate response with routing, deadline, and fallback.
+        
+        Args:
+            messages: Dialogue messages.
+            tools: Optional tool definitions.
+            return_dict: Return message dict if True.
+            max_tokens: Token generation limit.
+            on_fallback: Optional async or sync callback invoked immediately when remote
+                         fails before local generation completes, e.g. on_fallback(error).
         
         Returns: (response, route_used, model_used)
         """
         route = self.choose_route()
+        is_retry = bool(self.is_remote_unreachable and self.cooldown_remaining == 0 and route == "remote")
+
+        if route == "remote" and self.remote_client:
+            if is_retry:
+                if self._retry_lock.locked():
+                    route = "local"
+                else:
+                    await self._retry_lock.acquire()
+                    self.retry_in_progress = True
 
         if route == "remote" and self.remote_client:
             t0 = time.perf_counter()
@@ -156,21 +206,102 @@ class LLMRouter:
                     timeout=self.first_audio_deadline,
                 )
                 latency_ms = (time.perf_counter() - t0) * 1000.0
-                self.record_remote_result(latency_ms, error=False)
+                self.record_remote_result(latency_ms, error=False, unreachable=False)
+                if is_retry:
+                    self.retry_in_progress = False
+                    if self._retry_lock.locked():
+                        self._retry_lock.release()
                 return res, "remote", self.remote_client.model
-            except Exception as e:
-                logger.warning(f"Remote LLM call failed or timed out ({e}). Falling back to local model.")
-                self.record_remote_result(self.first_audio_deadline * 1000.0, error=True)
-                route = "local"
+            except (asyncio.TimeoutError, httpx.TimeoutException, httpx.ConnectError, Exception) as e:
+                self.last_remote_error = e
+                # Distinguish auth/config errors from unreachable
+                is_auth_error = isinstance(e, PermissionError) or "401" in str(e)
+                if is_auth_error:
+                    logger.warning(f"Remote authentication error ({e}). Routing locally without unreachable status.")
+                    self.record_remote_result(self.first_audio_deadline * 1000.0, error=True, unreachable=False)
+                else:
+                    logger.warning(f"Remote LLM unreachable or timed out ({e}). Triggering resilient local fallback.")
+                    self.record_remote_result(self.first_audio_deadline * 1000.0, error=True, unreachable=True)
 
-        # Local route execution or fallback
+                if is_retry:
+                    self.retry_in_progress = False
+                    if self._retry_lock.locked():
+                        self._retry_lock.release()
+
+                # Trigger immediate acknowledgment callback if provided
+                cb_task = None
+                if on_fallback is not None and not is_auth_error:
+                    try:
+                        res_cb = on_fallback(e)
+                        if asyncio.iscoroutine(res_cb):
+                            cb_task = asyncio.create_task(res_cb)
+                    except Exception as fe:
+                        logger.debug(f"Error in on_fallback callback: {fe}")
+
+                # Concurrently execute local inference while callback runs in background
+                if self.local_client:
+                    local_coro = self.local_client.generate_response(
+                        messages, tools=tools, return_dict=return_dict, max_tokens=max_tokens
+                    )
+                    local_task = asyncio.create_task(local_coro)
+                    try:
+                        res = await local_task
+                    except Exception as le:
+                        self.last_local_error = le
+                        logger.warning(f"Local LLM fallback failed ({le}).")
+                        if cb_task and not cb_task.done():
+                            try:
+                                await cb_task
+                            except Exception:
+                                pass
+                        # If remote client is configured and was not an auth error, give remote one direct attempt
+                        if self.remote_client and not is_auth_error:
+                            try:
+                                res = await self.remote_client.generate_response(
+                                    messages, tools=tools, return_dict=return_dict, max_tokens=max_tokens
+                                )
+                                return res, "remote", self.remote_client.model
+                            except Exception:
+                                pass
+                        raise
+                    if cb_task:
+                        try:
+                            await cb_task
+                        except Exception:
+                            pass
+                    return res, "local", self.local_client.model
+                elif self.remote_client:
+                    res = await self.remote_client.generate_response(
+                        messages, tools=tools, return_dict=return_dict, max_tokens=max_tokens
+                    )
+                    if cb_task:
+                        try:
+                            await cb_task
+                        except Exception:
+                            pass
+                    return res, "remote", self.remote_client.model
+
+        # Direct local route execution
         if self.local_client:
-            res = await self.local_client.generate_response(
-                messages, tools=tools, return_dict=return_dict, max_tokens=max_tokens
-            )
-            return res, "local", self.local_client.model
+            try:
+                res = await self.local_client.generate_response(
+                    messages, tools=tools, return_dict=return_dict, max_tokens=max_tokens
+                )
+                return res, "local", self.local_client.model
+            except Exception as le:
+                self.last_local_error = le
+                logger.warning(f"Local LLM execution failed ({le}). Trying remote backup if available.")
+                if self.remote_client and self.remote_client.is_configured and not self.force_local:
+                    try:
+                        res = await self.remote_client.generate_response(
+                            messages, tools=tools, return_dict=return_dict, max_tokens=max_tokens
+                        )
+                        return res, "remote", self.remote_client.model
+                    except Exception as re:
+                        self.last_remote_error = re
+                        raise
+                raise
         elif self.remote_client:
-            # If no local client exists, re-raise or attempt remote fallback model
             res = await self.remote_client.generate_response(
                 messages, tools=tools, return_dict=return_dict, max_tokens=max_tokens
             )

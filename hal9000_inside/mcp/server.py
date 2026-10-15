@@ -93,15 +93,103 @@ def memory_remember(text: str, category: str = "knowledge") -> str:
         raise
 
 
-@mcp_server.tool(name="web_search_wikipedia", description="Search Wikipedia using Puppeteer headless browser and extract readable text knowledge.")
+from hal9000_inside.wikipedia import WikipediaClient, KnowledgeClient
+
+_wiki_client: Optional[WikipediaClient] = None
+_knowledge_client: Optional[KnowledgeClient] = None
+
+
+def get_wiki_client() -> WikipediaClient:
+    global _wiki_client
+    if _wiki_client is None:
+        _wiki_client = WikipediaClient()
+    return _wiki_client
+
+
+def get_knowledge_client() -> KnowledgeClient:
+    global _knowledge_client
+    if _knowledge_client is None:
+        _knowledge_client = KnowledgeClient()
+    return _knowledge_client
+
+
+@mcp_server.tool(name="web_search_wikipedia", description="Search Wikipedia using native MediaWiki API and return candidate articles with page IDs and snippets.")
 async def web_search_wikipedia(query: str, language: str = "en") -> str:
-    """Search Wikipedia using headless browser navigation."""
-    browser = get_browser()
-    result = await browser.search_wikipedia(query, lang=language)
-    return json.dumps(result, indent=2)
+    """Search Wikipedia using MediaWiki API."""
+    client = get_wiki_client()
+    try:
+        results = await client.search(query, limit=5, language=language)
+        if not results:
+            return json.dumps({"status": "empty", "message": f"No Wikipedia results found for '{query}'.", "results": []})
+        return json.dumps({"status": "ok", "query": query, "language": language, "results": [r.to_dict() for r in results]}, indent=2)
+    except Exception as e:
+        return json.dumps({"status": "error", "error": f"Wikipedia search failed: {e}"})
 
 
-@mcp_server.tool(name="web_fetch_page", description="Fetch and extract readable text from any web URL using Puppeteer headless Chrome (e.g. documentation, articles, https://mcpservers.org/servers/progamesigner/wikipedia-mcp).")
+@mcp_server.tool(name="web_fetch_wikipedia_page", description="Fetch structured Wikipedia article content by numeric page ID using direct MediaWiki API.")
+async def web_fetch_wikipedia_page(page_id: int, language: str = "en") -> str:
+    """Fetch structured article content from Wikipedia by page ID."""
+    client = get_wiki_client()
+    try:
+        article = await client.fetch(page_id, language=language)
+        return json.dumps(article.to_dict(), indent=2)
+    except Exception as e:
+        return json.dumps({"status": "error", "error": f"Wikipedia fetch failed: {e}"})
+
+
+@mcp_server.tool(
+    name="knowledge_search",
+    description="Search across Wikipedia, Wikidata, arXiv, or Stack Exchange using native asynchronous APIs without external subprocesses.",
+)
+async def knowledge_search(
+    query: str,
+    source: str = "auto",
+    limit: int = 5,
+    language: str = "en",
+    site: str = "stackoverflow",
+) -> str:
+    """Multi-source knowledge search (wikipedia, wikidata, arxiv, stackexchange)."""
+    client = get_knowledge_client()
+    try:
+        res = await client.search(
+            query=query,
+            source=source,
+            limit=limit,
+            language=language,
+            site=site,
+        )
+        return json.dumps(res, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"status": "error", "error": f"Knowledge search failed: {e}"})
+
+
+@mcp_server.tool(
+    name="knowledge_fetch",
+    description="Fetch structured article, Wikidata claims, arXiv abstract, or Stack Exchange Q&A with accepted answers by identifier.",
+)
+async def knowledge_fetch(
+    source: str,
+    identifier: str,
+    max_chars: int = 16000,
+    language: str = "en",
+    site: str = "stackoverflow",
+) -> str:
+    """Multi-source knowledge fetch for specific items."""
+    client = get_knowledge_client()
+    try:
+        res = await client.fetch(
+            source=source,
+            identifier=identifier,
+            max_chars=max_chars,
+            language=language,
+            site=site,
+        )
+        return json.dumps(res, indent=2, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"status": "error", "error": f"Knowledge fetch failed: {e}"})
+
+
+@mcp_server.tool(name="web_fetch_page", description="Fetch and extract readable text from any web URL using Puppeteer headless Chrome (e.g. documentation, articles, external websites).")
 async def web_fetch_page(url: str) -> str:
     """Fetch text content from a web page using headless Chrome."""
     browser = get_browser()

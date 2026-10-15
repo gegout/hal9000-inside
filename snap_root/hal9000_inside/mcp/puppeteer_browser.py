@@ -40,10 +40,6 @@ class PuppeteerBrowser:
         """Fetch and extract readable text from a URL using headless Chrome."""
         return await self._run_action("fetch", url)
 
-    async def search_wikipedia(self, query: str, lang: str = "en") -> Dict[str, Any]:
-        """Search Wikipedia using headless browser navigation."""
-        return await self._run_action("search_wikipedia", query, lang)
-
     async def _run_action(self, action: str, target: str, extra: Optional[str] = None) -> Dict[str, Any]:
         args = [self.node_path, RUNNER_SCRIPT, action, target]
         if extra:

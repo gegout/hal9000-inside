@@ -26,10 +26,15 @@ E5_REVISION = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
 class MultilingualE5Embedder:
     """Computes exact 384-dim normalized multilingual E5 embeddings."""
 
-    def __init__(self, model_dir: str = DEFAULT_E5_DIR, providers: Optional[list] = None):
-        self.model_dir = model_dir
-        self.onnx_path = os.path.join(model_dir, "onnx/model.onnx")
-        self.tokenizer_path = os.path.join(model_dir, "onnx/tokenizer.json")
+    def __init__(self, model_dir: Optional[str] = None, model_path: Optional[str] = None, providers: Optional[list] = None):
+        if model_path:
+            self.onnx_path = model_path
+            self.model_dir = os.path.dirname(os.path.dirname(model_path)) if "onnx" in os.path.dirname(model_path) else os.path.dirname(model_path)
+            self.tokenizer_path = os.path.join(os.path.dirname(model_path), "tokenizer.json")
+        else:
+            self.model_dir = model_dir or DEFAULT_E5_DIR
+            self.onnx_path = os.path.join(self.model_dir, "onnx/model.onnx")
+            self.tokenizer_path = os.path.join(self.model_dir, "onnx/tokenizer.json")
         self.providers = providers or ["CPUExecutionProvider"]
         self._session = None
         self._tokenizer = None

@@ -18,9 +18,15 @@ def cmd_doctor(args):
     print("Running HAL 9000 Inside Doctor...")
     issues = 0
 
+    from hal9000_inside.config import load_config
+    cfg = load_config(args.config) if getattr(args, "config", None) else load_config()
+    cfg_files = cfg.get("files", {})
+    cfg_env = cfg.get("environment", {})
+
     # 1. OpenRouter API Key
     from hal9000_inside.llm import LLMClient, load_openrouter_api_key
-    key = load_openrouter_api_key()
+    custom_key_path = os.path.expanduser(cfg_files.get("openrouter_config_path", "~/.openrouter.config"))
+    key = load_openrouter_api_key(custom_path=custom_key_path) if "custom_path" in load_openrouter_api_key.__code__.co_varnames else load_openrouter_api_key()
     if key and key.startswith("sk-or-"):
         redacted = key[:8] + "..." + key[-4:]
         print(f"  [PASS] OpenRouter API Key configured: {redacted}")
@@ -31,32 +37,34 @@ def cmd_doctor(args):
     # 2. HAL 9000 Voice Model Checksums
     from hal9000_inside.tts import MODEL_PATH, CONFIG_PATH, EXPECTED_ONNX_SHA256, EXPECTED_JSON_SHA256
     import hashlib
-    if os.path.isfile(MODEL_PATH):
-        with open(MODEL_PATH, "rb") as f:
+    model_path = cfg_files.get("tts_model_path") or MODEL_PATH
+    config_path = cfg_files.get("tts_config_path") or CONFIG_PATH
+    if os.path.isfile(model_path):
+        with open(model_path, "rb") as f:
             h = hashlib.sha256(f.read()).hexdigest()
         if h == EXPECTED_ONNX_SHA256:
-            print(f"  [PASS] HAL 9000 ONNX verified: {MODEL_PATH}")
+            print(f"  [PASS] HAL 9000 ONNX verified: {model_path}")
         else:
             print(f"  [FAIL] HAL 9000 ONNX checksum mismatch: {h}")
             issues += 1
     else:
-        print(f"  [FAIL] HAL 9000 ONNX missing: {MODEL_PATH}")
+        print(f"  [FAIL] HAL 9000 ONNX missing: {model_path}")
         issues += 1
 
-    if os.path.isfile(CONFIG_PATH):
-        with open(CONFIG_PATH, "rb") as f:
+    if os.path.isfile(config_path):
+        with open(config_path, "rb") as f:
             h = hashlib.sha256(f.read()).hexdigest()
         if h == EXPECTED_JSON_SHA256:
-            print(f"  [PASS] HAL 9000 Config verified: {CONFIG_PATH}")
+            print(f"  [PASS] HAL 9000 Config verified: {config_path}")
         else:
             print(f"  [FAIL] HAL 9000 Config checksum mismatch: {h}")
             issues += 1
     else:
-        print(f"  [FAIL] HAL 9000 Config missing: {CONFIG_PATH}")
+        print(f"  [FAIL] HAL 9000 Config missing: {config_path}")
         issues += 1
 
     # 3. Myna Parakeet Model
-    parakeet_dir = os.path.expanduser("~/.cache/myna/models/parakeet-tdt-0.6b-v3-int8")
+    parakeet_dir = os.path.expanduser(cfg_files.get("parakeet_model_dir", "~/.cache/myna/models/parakeet-tdt-0.6b-v3-int8"))
     parakeet_enc = os.path.join(parakeet_dir, "encoder-model.int8.onnx")
     if os.path.isfile(parakeet_enc):
         print(f"  [PASS] Myna Parakeet TDT 0.6B model present: {parakeet_dir}")
@@ -65,7 +73,7 @@ def cmd_doctor(args):
         issues += 1
 
     # 4. Multilingual E5 Model
-    e5_dir = os.path.expanduser("~/.cache/hal9000/models/multilingual-e5-small/onnx")
+    e5_dir = os.path.expanduser(cfg_files.get("e5_model_dir", "~/.cache/hal9000/models/multilingual-e5-small/onnx"))
     e5_model = os.path.join(e5_dir, "model.onnx")
     if os.path.isfile(e5_model):
         print(f"  [PASS] Multilingual E5 ONNX model present: {e5_dir}")
@@ -99,8 +107,9 @@ def cmd_doctor(args):
         print("  [INFO] Intel GPU: None detected")
 
     # 7. Storage & Memory Paths
-    from hal9000_inside.memory import DEFAULT_DATA_DIR
-    print(f"  [PASS] Memory storage directory: {DEFAULT_DATA_DIR}")
+    storage_dir = os.path.expanduser(cfg_env.get("data_dir", "~/.local/share/hal9000-inside"))
+    print(f"  [PASS] Memory storage directory: {storage_dir}")
+
 
     if issues == 0:
         print("\nAll core system checks passed.")
@@ -191,13 +200,16 @@ def cmd_run(args):
         except Exception:
             pass
 
-    import logging
-    logging.basicConfig(level=logging.WARNING)
-    logging.getLogger().setLevel(logging.WARNING)
+    from hal9000_inside.config import load_config
+    cfg = load_config(args.config) if getattr(args, "config", None) else load_config()
 
+    from hal9000_inside.logging_config import setup_session_logging
+    data_dir = os.path.expanduser(cfg.get("environment", {}).get("data_dir", "~/.local/share/hal9000-inside"))
+    log_file = setup_session_logging(data_dir=data_dir)
+    
     from hal9000_inside.assistant import Hal9000Assistant
     
-    # Resolve GPU flags
+    # Resolve GPU flags (CLI flag overrides config file)
     use_nvidia = None
     if getattr(args, "nvidia", False):
         use_nvidia = True
@@ -212,24 +224,33 @@ def cmd_run(args):
 
     from hal9000_inside.audio import WavFileSource, WavFileSink
 
+    input_wav_path = getattr(args, "input_wav", None) or cfg.get("cli", {}).get("input_wav")
     audio_source = None
-    if getattr(args, "input_wav", None):
-        audio_source = WavFileSource(args.input_wav, real_time=False)
+    if input_wav_path:
+        audio_source = WavFileSource(input_wav_path, real_time=False)
 
+    output_wav_path = getattr(args, "output_wav", None) or cfg.get("cli", {}).get("output_wav")
     audio_sink = None
-    if getattr(args, "output_wav", None):
-        audio_sink = WavFileSink(args.output_wav)
+    if output_wav_path:
+        audio_sink = WavFileSink(output_wav_path)
+
+    auto_mode = None
+    if getattr(args, "push_to_talk", False):
+        auto_mode = False
 
     assistant = Hal9000Assistant(
         capture_device=args.device,
+        playback_device=cfg.get("cli", {}).get("playback_device") or None,
         model_override=args.model,
         endpoint_override=getattr(args, "endpoint", None),
-        auto_mode=not args.push_to_talk,
+        auto_mode=auto_mode,
         use_nvidia=use_nvidia,
         use_intel=use_intel,
         audio_source=audio_source,
         audio_sink=audio_sink,
         sleep_after_minutes=getattr(args, "sleep_after", None),
+        remote_deadline_seconds=getattr(args, "remote_deadline", None),
+        config=cfg,
     )
     try:
         asyncio.run(assistant.run())
@@ -246,6 +267,9 @@ def cmd_run(args):
 
 def cmd_sleep(args):
     """Run sleep mode headless, no audio devices opened, then exit."""
+    from hal9000_inside.config import load_config
+    cfg = load_config(args.config) if getattr(args, "config", None) else load_config()
+
     from hal9000_inside.cognition import SleepBudget, SleepManager
     from hal9000_inside.memory import MemoryStore, MultilingualE5Embedder
     from hal9000_inside.llm import LLMClient, LLMRouter
@@ -253,17 +277,27 @@ def cmd_sleep(args):
     from hal9000_inside.hardware import ComputeDeviceConfig
     from hal9000_inside.cognition import CuriosityEngine, PredictionEngine, InteroceptionMonitor
 
-    duration_min = float(getattr(args, "duration", 10.0))
+    cfg_cli_sleep = cfg.get("cli", {}).get("sleep", {})
+    cfg_env = cfg.get("environment", {})
+    cfg_files = cfg.get("files", {})
+    cfg_sleep = cfg.get("engine", {}).get("sleep", {})
+
+    duration_min = float(getattr(args, "duration", None) or cfg_cli_sleep.get("duration_minutes", 10.0))
     print(f"HAL 9000 entering headless sleep mode for {duration_min} minutes...")
 
     compute_cfg = ComputeDeviceConfig()
     embedder_providers = compute_cfg.get_onnx_providers(prefer_gpu=False)
+    e5_dir = os.path.expanduser(cfg_files.get("e5_model_dir", "~/.cache/hal9000/models/multilingual-e5-small/onnx"))
+    e5_model_file = os.path.join(e5_dir, "model.onnx") if os.path.isdir(e5_dir) else None
     try:
-        embedder = MultilingualE5Embedder(providers=embedder_providers)
+        embedder = MultilingualE5Embedder(model_path=e5_model_file, providers=embedder_providers)
     except Exception:
         embedder = None
 
-    data_dir = getattr(args, "data_dir", None)
+    data_dir = getattr(args, "data_dir", None) or os.path.expanduser(cfg_env.get("data_dir", "~/.local/share/hal9000-inside"))
+    from hal9000_inside.logging_config import setup_session_logging
+    setup_session_logging(data_dir=data_dir)
+
     memory = MemoryStore(data_dir=data_dir, embedder=embedder)
     llm = LLMClient()
     router = LLMRouter(remote_client=llm if not getattr(llm, 'is_local', False) else None)
@@ -272,7 +306,11 @@ def cmd_sleep(args):
     prediction = PredictionEngine(memory_store=memory)
     interoception = InteroceptionMonitor()
 
-    budget = SleepBudget(max_minutes=duration_min)
+    budget = SleepBudget(
+        max_minutes=duration_min,
+        max_tokens=int(cfg_sleep.get("max_tokens", 10000)),
+        max_web_fetches=int(cfg_sleep.get("max_web_fetches", 20)),
+    )
     sleep_mgr = SleepManager(
         memory_store=memory,
         curiosity_engine=curiosity,
@@ -298,6 +336,7 @@ def cmd_mcp(args):
 
 def main():
     parser = argparse.ArgumentParser(description="HAL 9000 Inside - Ubuntu Voice Assistant")
+    parser.add_argument("--config", help="Custom path to config.toml (default: ~/.hal9000-inside/config.toml)")
     subparsers = parser.add_subparsers(dest="command", help="Subcommand to execute")
 
     # doctor
@@ -329,7 +368,8 @@ def main():
     run_parser.add_argument("--endpoint", help="OpenAI-compatible base URL override (e.g. http://127.0.0.1:8336/v3)")
     run_parser.add_argument("--input-wav", help="Path to input WAV file to drive session from file instead of microphone")
     run_parser.add_argument("--output-wav", help="Path to output WAV file to record assistant speech instead of speaker")
-    run_parser.add_argument("--sleep-after", type=float, default=None, help="Auto-enter sleep mode after specified minutes of silence")
+    run_parser.add_argument("--sleep-after", type=float, default=2.0, help="Auto-enter sleep mode after specified minutes of silence (default: 2.0 minutes)")
+    run_parser.add_argument("--remote-deadline", type=float, default=8.0, help="Remote request deadline in seconds before local fallback (default: 8.0s)")
 
     # GPU options
     nvidia_group = run_parser.add_mutually_exclusive_group()

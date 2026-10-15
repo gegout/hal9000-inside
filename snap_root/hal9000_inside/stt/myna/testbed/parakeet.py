@@ -683,7 +683,7 @@ class _ParakeetOnnx:
                 if best_rank[0] < UNTRANSCRIBED_GAP_S:
                     break
             if best_rank[0] >= UNTRANSCRIBED_GAP_S:
-                _log.warning(
+                _log.debug(
                     "parakeet left %.1f s of %.1f s untranscribed after %d nudged re-decodes",
                     best_rank[0],
                     len(samples) / PARAKEET_RATE,

@@ -68,6 +68,8 @@ class SleepManager:
         budget: Optional[SleepBudget] = None,
         data_dir: Optional[str] = None,
         clock: Optional[Any] = None,
+        wiki_client: Optional[Any] = None,
+        knowledge_client: Optional[Any] = None,
     ):
         self.memory = memory_store
         self.curiosity = curiosity_engine
@@ -75,6 +77,8 @@ class SleepManager:
         self.mcp = mcp_client
         self.router = llm_router
         self.interoception = interoception_monitor
+        self.wiki = wiki_client
+        self.knowledge = knowledge_client
         self.budget = budget or SleepBudget()
         self.clock = clock or time
         self.data_dir = data_dir or getattr(memory_store, "data_dir", os.path.expanduser("~/.local/share/hal9000-inside"))
@@ -100,11 +104,15 @@ class SleepManager:
         # If forced local, definitely offline
         if getattr(self.router, "force_local", False):
             return False
-        if not getattr(self.router, "remote_client", None):
-            return False
-        if hasattr(self.router, "connectivity") and self.router.connectivity:
-            return bool(self.router.connectivity.is_connected)
-        return True
+        # If remote client is configured, check its connectivity
+        if getattr(self.router, "remote_client", None):
+            if hasattr(self.router, "connectivity") and self.router.connectivity:
+                return bool(self.router.connectivity.is_connected)
+            return True
+        # If local client is configured (e.g. gemma on local endpoint) without force_local
+        if getattr(self.router, "local_client", None):
+            return True
+        return False
 
     def _budget_exhausted(self, start_time: float) -> bool:
         """Check if any configured budget limit has been reached."""
@@ -143,6 +151,17 @@ class SleepManager:
         online_status = self._is_online()
         max_duration_seconds = self.budget.max_minutes * 60.0
 
+        # Self-generate curiosity questions from previous conversations if online and fewer than 5 exist
+        if online_status and self.curiosity and hasattr(self.curiosity, "generate_autonomous_questions"):
+            try:
+                await self.curiosity.generate_autonomous_questions(min_count=5)
+            except Exception as e:
+                logger.debug(f"Sleep curiosity autonomous generation failed: {e}")
+
+        current_dream: Optional[str] = None
+        curiosity_items_explored = 0
+        last_curiosity_time = 0.0
+
         try:
             while not self.is_wake_requested() and not self._budget_exhausted(start_time):
                 # Update UI status
@@ -154,13 +173,23 @@ class SleepManager:
                 pending_curiosity = len(self.curiosity.get_pending()) if self.curiosity else 0
                 completed_curiosity = len(getattr(self.curiosity, "completed_questions", [])) if self.curiosity else 0
                 if ui_callback:
-                    ui_callback(
-                        completed_curiosity,
-                        completed_curiosity + pending_curiosity,
-                        self.notes_written,
-                        online_status,
-                        seconds_left,
-                    )
+                    try:
+                        ui_callback(
+                            completed_curiosity,
+                            completed_curiosity + pending_curiosity,
+                            self.notes_written,
+                            online_status,
+                            seconds_left,
+                            current_dream,
+                        )
+                    except TypeError:
+                        ui_callback(
+                            completed_curiosity,
+                            completed_curiosity + pending_curiosity,
+                            self.notes_written,
+                            online_status,
+                            seconds_left,
+                        )
 
                 cycle_work_done = False
 
@@ -180,18 +209,52 @@ class SleepManager:
                     break
 
                 # ---------------------------------------------------------
-                # 2. Endogenous Curiosity (Online only)
-                # Offline rule: restructure, never invent. Steps 2 & 3 skipped offline.
+                # 2. Endogenous Curiosity (MCP search or LLM reflection) - Online only
+                # Pacing: activate 5 curiosity items initially, then 1 per minute (60s interval).
                 # ---------------------------------------------------------
                 if online_status and self.curiosity and self.web_fetches_used < self.budget.max_web_fetches and self.tokens_used < self.budget.max_tokens:
                     pending = self.curiosity.get_pending()
                     if pending:
-                        q = pending[0]
-                        res = await self._explore_curiosity_online(q, episode_id)
-                        if res:
-                            self.jobs_run += 1
-                            self.notes_written += 1
-                            cycle_work_done = True
+                        can_explore = False
+                        if curiosity_items_explored < 5:
+                            can_explore = True
+                        elif (now - last_curiosity_time) >= 60.0:
+                            can_explore = True
+
+                        if can_explore:
+                            q = pending[0]
+                            current_dream = q
+                            if ui_callback:
+                                try:
+                                    ui_callback(
+                                        completed_curiosity,
+                                        completed_curiosity + pending_curiosity,
+                                        self.notes_written,
+                                        online_status,
+                                        seconds_left,
+                                        current_dream,
+                                    )
+                                except TypeError:
+                                    ui_callback(
+                                        completed_curiosity,
+                                        completed_curiosity + pending_curiosity,
+                                        self.notes_written,
+                                        online_status,
+                                        seconds_left,
+                                    )
+                            res = await self._explore_curiosity_online(q, episode_id)
+                            curiosity_items_explored += 1
+                            last_curiosity_time = self.clock.time()
+                            if res:
+                                self.jobs_run += 1
+                                self.notes_written += 1
+                                cycle_work_done = True
+                                # Keep dream summary active or updated
+                                if res.get("summary"):
+                                    current_dream = res["summary"]
+                                    if current_dream.startswith("Discovery regarding '"):
+                                        # concise dream: topic summary
+                                        current_dream = q
 
                 if self.is_wake_requested() or self._budget_exhausted(start_time):
                     break
@@ -265,20 +328,21 @@ class SleepManager:
             except Exception:
                 pass
 
-        summary = SleepSummary(
-            duration_seconds=duration,
-            jobs_run=self.jobs_run,
-            notes_written=self.notes_written,
-            cost_estimate=round(self.tokens_used * 0.000002, 6),
-            is_online=online_status,
-            interrupted=self.is_wake_requested(),
-        )
+            summary = SleepSummary(
+                duration_seconds=duration,
+                jobs_run=self.jobs_run,
+                notes_written=self.notes_written,
+                cost_estimate=round(self.tokens_used * 0.000002, 6),
+                is_online=online_status,
+                interrupted=self.is_wake_requested(),
+            )
 
-        # Store sleep report in InteroceptionMonitor so it's injected on the next spoken turn
-        if self.interoception:
-            self.interoception.set_sleep_report(summary.format_one_liner())
+            # Store sleep report in InteroceptionMonitor so it's injected on the next spoken turn
+            if self.interoception:
+                self.interoception.set_sleep_report(summary.format_one_liner())
 
-        logger.info(f"HAL sleep complete: {summary.format_one_liner()}")
+            logger.info(f"HAL sleep complete: {summary.format_one_liner()}")
+
         return summary
 
     async def _explore_curiosity_online(self, question: str, episode_id: str) -> Optional[dict]:
@@ -296,17 +360,92 @@ class SleepManager:
         source = "web"
         source_urls = []
 
-        # 1. Search web via MCP if available
+        # 1. Search web via MCP if available (prioritizing free-search-mcp tools)
         if self.mcp:
             try:
                 tools = self.mcp.get_openai_tools()
                 tool_names = [t.get("function", {}).get("name") for t in tools] if tools else []
-                if "web_search_wikipedia" in tool_names:
-                    res = await self.mcp.call_tool("web_search_wikipedia", {"query": question})
-                    self.web_fetches_used += 1
-                    answer_text = str(res)[:1000]
+                today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+                raw_str = ""
+                # Attempt deep research or multi-engine web search (Bing -> DuckDuckGo -> Mojeek)
+                if "research" in tool_names:
+                    try:
+                        res = await self.mcp.call_tool("research", {"question": question})
+                        self.web_fetches_used += 1
+                        raw_str = str(res)
+                    except Exception as re:
+                        logger.debug(f"Sleep research tool failed: {re}")
+                elif "search" in tool_names:
+                    try:
+                        res = await self.mcp.call_tool("search", {"query": question, "max_results": 5})
+                        self.web_fetches_used += 1
+                        raw_str = str(res)
+                    except Exception as se:
+                        logger.debug(f"Sleep search tool failed: {se}")
+
+                # If web search returned no results, decoy/error, or if wikipedia is available to cross-reference
+                has_web_content = bool(
+                    raw_str and "No results found" not in raw_str and "error" not in raw_str.lower()[:80]
+                )
+
+                if has_web_content:
+                    import re
+                    found_urls = re.findall(r'<https?://[^>]+>', raw_str)
+                    clean_urls = [u[1:-1] for u in found_urls]
+                    if not clean_urls:
+                        clean_urls = re.findall(r'https?://[^\s\)>]+', raw_str)
+                    source_urls.extend(list(dict.fromkeys(clean_urls))[:5])
+                    answer_text = raw_str[:2000]
+
+                # Combine or fallback with KnowledgeClient or Wikipedia search if needed
+                if self.knowledge and (not has_web_content or len(answer_text or "") < 150):
+                    try:
+                        k_res = await self.knowledge.search_and_fetch_best(question)
+                        if k_res and k_res.get("status") == "ok" and k_res.get("text"):
+                            self.web_fetches_used += 1
+                            if k_res.get("url") and k_res.get("url") not in source_urls:
+                                source_urls.append(k_res["url"])
+                            k_src = k_res.get("source", "knowledge").capitalize()
+                            k_header = f"[{k_src}: {k_res.get('title', 'Unknown')} (rev {k_res.get('revision_id') or 'latest'}, {k_res.get('language') or 'en'})]:"
+                            if answer_text:
+                                answer_text = f"{answer_text}\n\n{k_header}\n{k_res['text'][:1000]}"
+                            else:
+                                answer_text = f"{k_header}\n{k_res['text'][:2000]}"
+                    except Exception as ke:
+                        logger.debug(f"Sleep native knowledge client failed: {ke}")
+                elif self.wiki and (not has_web_content or len(answer_text or "") < 150):
+                    try:
+                        wiki_art = await self.wiki.search_and_fetch_best(question)
+                        if wiki_art and wiki_art.status == "ok" and wiki_art.extract:
+                            self.web_fetches_used += 1
+                            if wiki_art.url and wiki_art.url not in source_urls:
+                                source_urls.append(wiki_art.url)
+                            wiki_header = f"[Wikipedia: {wiki_art.title} (rev {wiki_art.revision_id or 'unknown'}, {wiki_art.language})]:"
+                            if answer_text:
+                                answer_text = f"{answer_text}\n\n{wiki_header}\n{wiki_art.extract[:1000]}"
+                            else:
+                                answer_text = f"{wiki_header}\n{wiki_art.extract[:2000]}"
+                    except Exception as we:
+                        logger.debug(f"Sleep native wikipedia client failed: {we}")
+                elif "web_search_wikipedia" in tool_names and (not has_web_content or len(answer_text or "") < 150):
+                    try:
+                        wiki_res = await self.mcp.call_tool("web_search_wikipedia", {"query": question})
+                        self.web_fetches_used += 1
+                        wiki_str = str(wiki_res).strip()
+                        if wiki_str and not wiki_str.startswith("Error"):
+                            wiki_url = "https://en.wikipedia.org/wiki/" + question.replace(" ", "_")
+                            if wiki_url not in source_urls:
+                                source_urls.append(wiki_url)
+                            if answer_text:
+                                answer_text = f"{answer_text}\n\n[Wikipedia Summary]:\n{wiki_str[:1000]}"
+                            else:
+                                answer_text = wiki_str[:2000]
+                    except Exception as we:
+                        logger.debug(f"Sleep wikipedia search tool failed: {we}")
+
+                if answer_text:
                     source = "web"
-                    source_urls = ["https://en.wikipedia.org/wiki/" + question.replace(" ", "_")]
                 elif "puppeteer_search" in tool_names:
                     res = await self.mcp.call_tool("puppeteer_search", {"query": question})
                     self.web_fetches_used += 1
@@ -315,28 +454,84 @@ class SleepManager:
             except Exception as e:
                 logger.debug(f"Sleep curiosity MCP lookup failed: {e}")
 
-        # 2. Remote model inquiry if MCP didn't yield text
-        if not answer_text and self.router and getattr(self.router, "remote_client", None):
+        # 2. Model inquiry (remote or local via router) if MCP didn't yield text
+        if not answer_text and self.router and getattr(self.router, "is_configured", False):
             try:
-                prompt = [
-                    {"role": "system", "content": "You are HAL 9000 conducting internal cognitive curiosity exploration. Provide a concise factual answer in 1-2 sentences."},
-                    {"role": "user", "content": question},
+                # Sleep mode model and configuration as specified:
+                # model: z-ai/glm-5.3
+                # system message: "Prioritise accuracy, thorough analysis, deep searches. Check assumptions, consider alternatives, and distinguish verified facts from uncertainty."
+                # reasoning: {"effort": "max"}
+                # max_tokens: 65536
+                # stream: True
+                # provider: {"require_parameters": True}
+                sleep_model = "z-ai/glm-5.3"
+                messages = [
+                    {
+                        "role": "system",
+                        "content": "Prioritise accuracy, thorough analysis, deep searches. Check assumptions, consider alternatives, and distinguish verified facts from uncertainty.",
+                    },
+                    {
+                        "role": "user",
+                        "content": question,
+                    },
                 ]
-                reply = await self.router.remote_client.generate_response(prompt, max_tokens=150)
+                sleep_client = getattr(self.router, "remote_client", None) or self.router
+                if hasattr(sleep_client, "stream_response"):
+                    collected_tokens: List[str] = []
+                    async for chunk in sleep_client.stream_response(
+                        messages=messages,
+                        model=sleep_model,
+                        max_tokens=65536,
+                        reasoning={"effort": "max"},
+                        provider={"require_parameters": True},
+                    ):
+                        collected_tokens.append(chunk)
+                    reply = "".join(collected_tokens).strip()
+                    if not reply and hasattr(sleep_client, "generate_response"):
+                        reply = await sleep_client.generate_response(
+                            messages=messages,
+                            model=sleep_model,
+                            max_tokens=65536,
+                            reasoning={"effort": "max"},
+                            provider={"require_parameters": True},
+                        )
+                    source = "remote_model" if not getattr(sleep_client, "is_local", False) else "local_model"
+                elif hasattr(self.router, "generate"):
+                    reply, route_used, _ = await self.router.generate(messages, max_tokens=150)
+                    source = "remote_model" if route_used == "remote" else "local_model"
+                elif getattr(self.router, "remote_client", None):
+                    reply = await self.router.remote_client.generate_response(
+                        messages,
+                        model=sleep_model,
+                        max_tokens=65536,
+                        reasoning={"effort": "max"},
+                        provider={"require_parameters": True},
+                    )
+                    source = "remote_model"
+                else:
+                    reply = await self.router.generate_response(messages, max_tokens=150)
+                    source = "local_model"
                 self.tokens_used += 150
                 answer_text = str(reply).strip()
-                source = "remote_model"
             except Exception as e:
-                logger.debug(f"Sleep curiosity remote model failed: {e}")
+                logger.debug(f"Sleep curiosity model failed: {e}")
 
         if answer_text:
-            text_to_save = f"Discovery regarding '{question}': {answer_text}"
-            provenance = "web" if source == "web" else "remote_model"
+            today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+            provenance = "web" if source == "web" else source
+            if provenance == "web":
+                citation_str = f" [Sources: {', '.join(source_urls)}]" if source_urls else ""
+                text_to_save = f"Discovery regarding '{question}' (retrieved {today_str}){citation_str}: {answer_text}"
+                conf = 0.85
+            else:
+                text_to_save = f"Discovery regarding '{question}': {answer_text}"
+                conf = 0.70
+
             mem_id = self.memory.remember(
                 text=text_to_save,
                 category="curiosity",
                 provenance=provenance,
-                confidence=0.9,
+                confidence=conf,
                 salience=0.7,
                 episode_id=episode_id,
                 source_urls=source_urls,
@@ -350,8 +545,8 @@ class SleepManager:
         return None
 
     async def _rehearse_prediction_online(self, prediction: str, episode_id: str) -> Optional[dict]:
-        """Synthesize high-quality exemplar answer for an anticipated follow-up using remote model."""
-        if not self.router or not getattr(self.router, "remote_client", None):
+        """Synthesize high-quality exemplar answer for an anticipated follow-up."""
+        if not self.router or not getattr(self.router, "is_configured", False):
             return None
 
         # Remove from predictions
@@ -363,14 +558,22 @@ class SleepManager:
                 {"role": "system", "content": "You are HAL 9000 rehearsing anticipated dialogue. Provide a calm, precise 1-sentence answer suitable for a spoken voice assistant."},
                 {"role": "user", "content": f"How would HAL 9000 respond if asked: '{prediction}'?"},
             ]
-            reply = await self.router.remote_client.generate_response(prompt, max_tokens=120)
+            if hasattr(self.router, "generate"):
+                reply, route_used, _ = await self.router.generate(prompt, max_tokens=120)
+                source = "remote_model" if route_used == "remote" else "local_model"
+            elif getattr(self.router, "remote_client", None):
+                reply = await self.router.remote_client.generate_response(prompt, max_tokens=120)
+                source = "remote_model"
+            else:
+                reply = await self.router.generate_response(prompt, max_tokens=120)
+                source = "local_model"
             self.tokens_used += 120
             ans = str(reply).strip()
             if ans:
                 mem_id = self.memory.remember(
                     text=f"Rehearsal exemplar for '{prediction}': {ans}",
                     category="rehearsal",
-                    provenance="remote_model",
+                    provenance=source,
                     confidence=0.9,
                     salience=0.6,
                     episode_id=episode_id,
@@ -439,24 +642,32 @@ class SleepManager:
         # Query SQLite turn telemetry
         sqlite_path = getattr(self.memory, "sqlite_path", None)
         if sqlite_path and os.path.exists(sqlite_path):
+            conn = None
             try:
-                with sqlite3.connect(sqlite_path) as conn:
-                    cur = conn.cursor()
-                    cur.execute("SELECT COUNT(*), AVG(stt_ms), AVG(llm_ms), SUM(errors) FROM turn_telemetry")
-                    row = cur.fetchone()
-                    if row and row[0]:
-                        total_turns = row[0]
-                        avg_stt = round(row[1] or 0.0, 1)
-                        avg_llm = round(row[2] or 0.0, 1)
-                        errors = row[3] or 0
-                        model_data["telemetry_summary"] = {
-                            "total_turns": total_turns,
-                            "avg_stt_ms": avg_stt,
-                            "avg_llm_ms": avg_llm,
-                            "error_rate": round(errors / max(1, total_turns), 3),
-                        }
+                conn = sqlite3.connect(sqlite_path, timeout=15.0)
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*), AVG(stt_ms), AVG(llm_ms), SUM(errors) FROM turn_telemetry")
+                row = cur.fetchone()
+                if row and row[0]:
+                    total_turns = row[0]
+                    avg_stt = round(row[1] or 0.0, 1)
+                    avg_llm = round(row[2] or 0.0, 1)
+                    errors = row[3] or 0
+                    model_data["telemetry_summary"] = {
+                        "total_turns": total_turns,
+                        "avg_stt_ms": avg_stt,
+                        "avg_llm_ms": avg_llm,
+                        "error_rate": round(errors / max(1, total_turns), 3),
+                    }
             except Exception:
                 pass
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
 
         # Self-improvement parameter tuning within safe bounds:
         # salience_weight in [0.05, 0.50]

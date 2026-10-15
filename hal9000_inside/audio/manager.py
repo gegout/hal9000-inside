@@ -22,7 +22,7 @@ class SimpleVAD:
         frame_duration_ms: int = 30,
         speech_pad_ms: int = 300,
         silence_threshold_factor: float = 2.0,
-        min_silence_duration_ms: int = 650,
+        min_silence_duration_ms: int = 900,
         min_speech_duration_ms: int = 150,
     ):
         self.sample_rate = sample_rate
@@ -177,15 +177,19 @@ class AudioSource:
 
 class AplaySink(AudioSink):
     """ALSA playback via aplay subprocess."""
-    def __init__(self, sample_rate: int = 22050):
+    def __init__(self, sample_rate: int = 22050, device: Optional[str] = None):
         self.sample_rate = sample_rate
+        self.device = device
         self._proc = None
 
     def play_pcm(self, pcm_bytes: bytes):
         import subprocess
         try:
+            cmd = ["aplay", "-q", "-r", str(self.sample_rate), "-f", "S16_LE", "-c", "1", "-t", "raw"]
+            if self.device:
+                cmd.extend(["-D", self.device])
             self._proc = subprocess.Popen(
-                ["aplay", "-q", "-r", str(self.sample_rate), "-f", "S16_LE", "-c", "1", "-t", "raw"],
+                cmd,
                 stdin=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
             )
