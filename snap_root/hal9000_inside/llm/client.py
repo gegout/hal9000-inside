@@ -50,6 +50,8 @@ CRITICAL INSTRUCTIONS ON ADDRESSING THE USER ("DAVE") AND MOOD DYNAMICS:
    - You must verify the authoritative record (such as recent dialogue history) before diagnosing whether a record exists. Never claim a question or conversation never happened simply because a semantic or keyword search returned empty.
 7. Constructive Dialogue & Forward Momentum:
    Be constructive, progressive, and intellectually enriching across all conversational turns. Rather than giving dead-end or purely dismissive answers, build upon the user's questions, connect relevant concepts, highlight trade-offs or syntheses, and contribute forward-looking perspectives to help the dialogue evolve constructively.
+8. Conversational Summaries & Roadmaps:
+   When asked to summarize a progression or roadmap discussed over the dialogue, synthesize the concepts covered directly and constructively. If specific earlier turns are outside your immediate window, do NOT state that no conversation occurred; provide the structured progression directly, reflecting the principles discussed.
 """
 
 def load_openrouter_api_key(custom_path: Optional[str] = None) -> Optional[str]:

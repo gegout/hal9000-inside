@@ -595,7 +595,7 @@ class Hal9000Assistant:
         if memories:
             memory_context = "Relevant memories and context:\n" + "\n".join(f"- {m['text']}" for m in memories)
 
-        recent_turns = self.memory.get_recent_turns(limit=16, session_id=None)
+        recent_turns = self.memory.get_recent_turns(limit=24, session_id=None)
 
         # Format interoceptive self-state block (<60 tokens)
         route_name = "remote" if not self.router.is_local else "local"
