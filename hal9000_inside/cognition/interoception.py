@@ -92,8 +92,8 @@ class InteroceptionMonitor:
         if self.last_error or self._consecutive_errors > 0 or not connected:
             return "defensive"
 
-        # Strained condition -> Concerned
-        if (recent_latency_ms and recent_latency_ms > 3500) or (cpu_load is not None and cpu_load > 2.0):
+        # Strained condition -> Concerned (e.g. persistent elevated network latency or CPU overload)
+        if (recent_latency_ms and recent_latency_ms > 5500) or (cpu_load is not None and cpu_load > 2.0):
             return "concerned"
 
         # Elevated load / memory pressure -> Suspicious
