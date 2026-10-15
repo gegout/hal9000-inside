@@ -235,6 +235,10 @@ class LLMClient:
                         continue
                     if resp.is_error:
                         err_text = resp.text
+                        # If the endpoint enforces mandatory reasoning, transparently fall back to low effort
+                        if resp.status_code == 400 and "reasoning is mandatory" in err_text.lower() and payload.get("reasoning", {}).get("effort") == "none":
+                            payload["reasoning"] = {"effort": "low"}
+                            continue
                         raise RuntimeError(f"{prefix} request failed (HTTP {resp.status_code}): {err_text}")
                     data = resp.json()
                     msg = data["choices"][0]["message"]
