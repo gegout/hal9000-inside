@@ -35,10 +35,17 @@ def cmd_doctor(args):
         issues += 1
 
     # 2. HAL 9000 Voice Model Checksums
-    from hal9000_inside.tts import MODEL_PATH, CONFIG_PATH, EXPECTED_ONNX_SHA256, EXPECTED_JSON_SHA256
+    from hal9000_inside.tts import (
+        MODEL_PATH,
+        CONFIG_PATH,
+        EXPECTED_ONNX_SHA256,
+        EXPECTED_JSON_SHA256,
+        resolve_model_path,
+        resolve_config_path,
+    )
     import hashlib
-    model_path = cfg_files.get("tts_model_path") or MODEL_PATH
-    config_path = cfg_files.get("tts_config_path") or CONFIG_PATH
+    model_path = resolve_model_path(cfg_files.get("tts_model_path"))
+    config_path = resolve_config_path(cfg_files.get("tts_config_path"))
     if os.path.isfile(model_path):
         with open(model_path, "rb") as f:
             h = hashlib.sha256(f.read()).hexdigest()

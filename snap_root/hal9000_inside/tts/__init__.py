@@ -5,6 +5,8 @@ from .hal_piper import (
     CONFIG_PATH,
     EXPECTED_ONNX_SHA256,
     EXPECTED_JSON_SHA256,
+    resolve_model_path,
+    resolve_config_path,
 )
 
 __all__ = [
@@ -14,4 +16,6 @@ __all__ = [
     "CONFIG_PATH",
     "EXPECTED_ONNX_SHA256",
     "EXPECTED_JSON_SHA256",
+    "resolve_model_path",
+    "resolve_config_path",
 ]

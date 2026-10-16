@@ -32,6 +32,28 @@ def split_sentences(text: str) -> List[str]:
     return results
 
 
+def resolve_model_path(path: Optional[str] = None) -> str:
+    """Resolve model path, falling back to bundled MODEL_PATH if relative path is missing."""
+    if path:
+        expanded = os.path.expanduser(path)
+        if os.path.isabs(expanded) and os.path.isfile(expanded):
+            return expanded
+        if os.path.isfile(expanded):
+            return os.path.abspath(expanded)
+    return MODEL_PATH
+
+
+def resolve_config_path(path: Optional[str] = None) -> str:
+    """Resolve config path, falling back to bundled CONFIG_PATH if relative path is missing."""
+    if path:
+        expanded = os.path.expanduser(path)
+        if os.path.isabs(expanded) and os.path.isfile(expanded):
+            return expanded
+        if os.path.isfile(expanded):
+            return os.path.abspath(expanded)
+    return CONFIG_PATH
+
+
 class HalPiperTTS:
     """Resident Piper voice synthesizer for HAL 9000."""
 
@@ -41,8 +63,8 @@ class HalPiperTTS:
         config_path: Optional[str] = None,
         use_cuda: bool = False,
     ):
-        self.model_path = model_path or MODEL_PATH
-        self.config_path = config_path or CONFIG_PATH
+        self.model_path = resolve_model_path(model_path)
+        self.config_path = resolve_config_path(config_path)
         self.use_cuda = use_cuda
         self._voice = None
         self._cancelled = False

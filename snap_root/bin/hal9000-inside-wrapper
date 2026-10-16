@@ -1,4 +1,14 @@
 #!/bin/bash
 export LD_LIBRARY_PATH="$SNAP/usr/lib:$SNAP/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
-export PYTHONPATH="$SNAP/lib/python3.12/site-packages:$SNAP/usr/lib/python3/dist-packages:$PYTHONPATH"
-exec "$SNAP/usr/bin/python3" -m hal9000_inside.cli.main "$@"
+export PYTHONPATH="$SNAP:$SNAP/lib/python3.12/site-packages:$SNAP/usr/lib/python3/dist-packages:$PYTHONPATH"
+
+# In core24 base, python3.12 is located at /usr/bin/python3 or /usr/bin/python3.12 in the base environment
+if [ -x "/usr/bin/python3" ]; then
+    PYTHON_EXEC="/usr/bin/python3"
+elif [ -x "$SNAP/usr/bin/python3" ]; then
+    PYTHON_EXEC="$SNAP/usr/bin/python3"
+else
+    PYTHON_EXEC="$(which python3)"
+fi
+
+exec "$PYTHON_EXEC" -m hal9000_inside.cli.main "$@"
