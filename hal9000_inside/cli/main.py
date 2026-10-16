@@ -329,8 +329,21 @@ def cmd_sleep(args):
         data_dir=memory.data_dir,
     )
 
-    summary = asyncio.run(sleep_mgr.run_sleep_cycle())
-    print(f"Sleep complete: {summary.format_one_liner()}")
+    from hal9000_inside.ui import TerminalUI
+    ui = TerminalUI()
+
+    def _ui_cb(c_done, c_total, n_added, is_on, sec_left, dream=None):
+        ui.update_sleep_status(
+            curiosity_done=c_done,
+            curiosity_total=c_total,
+            notes_added=n_added,
+            is_online=is_on,
+            seconds_left=sec_left,
+            dream=dream,
+        )
+
+    summary = asyncio.run(sleep_mgr.run_sleep_cycle(ui_callback=_ui_cb))
+    print(f"\nSleep complete: {summary.format_one_liner()}")
     return 0
 
 
