@@ -44,14 +44,18 @@ class SleepSummary:
     cost_estimate: float = 0.0
     is_online: bool = False
     interrupted: bool = False
+    dream_summary: Optional[str] = None
 
     def format_one_liner(self) -> str:
-        """Produce honest one-line sleep report: e.g. 'Slept 20 min, learned 7 notes, offline the whole time'"""
+        """Produce honest one-line sleep report: e.g. 'Slept 20 min, learned 7 notes, online.'"""
         minutes = int(self.duration_seconds // 60)
         sec = int(self.duration_seconds % 60)
         dur_str = f"{minutes} min" if minutes > 0 else f"{sec}s"
         conn_str = "online" if self.is_online else "offline the whole time"
-        return f"Slept {dur_str}, learned {self.notes_written} notes, {conn_str}."
+        msg = f"Slept {dur_str}, learned {self.notes_written} notes, {conn_str}."
+        if self.dream_summary:
+            msg += f" Dreamt of: {self.dream_summary}"
+        return msg
 
 
 class SleepManager:
@@ -211,9 +215,17 @@ class SleepManager:
                 # ---------------------------------------------------------
                 # 2. Endogenous Curiosity (MCP search or LLM reflection) - Online only
                 # Pacing: activate 5 curiosity items initially, then 1 per minute (60s interval).
+                # Replenish queue if it runs empty and budget remains.
                 # ---------------------------------------------------------
                 if online_status and self.curiosity and self.web_fetches_used < self.budget.max_web_fetches and self.tokens_used < self.budget.max_tokens:
                     pending = self.curiosity.get_pending()
+                    if not pending and hasattr(self.curiosity, "generate_autonomous_questions"):
+                        try:
+                            await self.curiosity.generate_autonomous_questions(min_count=5)
+                            pending = self.curiosity.get_pending()
+                        except Exception as ge:
+                            logger.debug(f"Sleep curiosity replenishment failed: {ge}")
+
                     if pending:
                         can_explore = False
                         if curiosity_items_explored < 5:
@@ -328,6 +340,8 @@ class SleepManager:
             except Exception:
                 pass
 
+            dream_summary = await self._synthesize_dream_summary(episode_id=episode_id, current_dream=current_dream)
+
             summary = SleepSummary(
                 duration_seconds=duration,
                 jobs_run=self.jobs_run,
@@ -335,15 +349,58 @@ class SleepManager:
                 cost_estimate=round(self.tokens_used * 0.000002, 6),
                 is_online=online_status,
                 interrupted=self.is_wake_requested(),
+                dream_summary=dream_summary,
             )
 
             # Store sleep report in InteroceptionMonitor so it's injected on the next spoken turn
             if self.interoception:
                 self.interoception.set_sleep_report(summary.format_one_liner())
 
+            if summary.dream_summary:
+                logger.info(f"HAL dream summary: {summary.dream_summary}")
             logger.info(f"HAL sleep complete: {summary.format_one_liner()}")
 
         return summary
+
+    async def _synthesize_dream_summary(self, episode_id: str, current_dream: Optional[str] = None) -> Optional[str]:
+        """Synthesize an authentic dreaming summary from consolidated memories, curiosity explorations, or active cognitive state."""
+        # 1. Gather recent memories added or updated during sleep or recent dialogue
+        dream_topics = []
+        try:
+            if hasattr(self.memory, "inspect_all"):
+                mems = self.memory.inspect_all()
+                # Pick curiosity/observation memories
+                curiosity_mems = [m for m in mems if m.get("category") == "curiosity" or m.get("provenance") in ("curiosity", "web", "remote_model")]
+                # Take up to 3 most recent
+                for m in curiosity_mems[-3:]:
+                    txt = m.get("text", "")
+                    if "Discovery regarding '" in txt:
+                        topic = txt.split("Discovery regarding '")[1].split("'")[0]
+                        dream_topics.append(topic)
+                    else:
+                        dream_topics.append(txt[:80])
+        except Exception as e:
+            logger.debug(f"Failed to inspect memories for dream summary: {e}")
+
+        # 2. If current_dream is set and not already in topics, add it
+        if current_dream:
+            clean_cd = current_dream
+            if clean_cd.startswith("Discovery regarding '"):
+                clean_cd = clean_cd.split("Discovery regarding '")[1].split("'")[0]
+            if clean_cd not in dream_topics:
+                dream_topics.append(clean_cd)
+
+        # 3. Clean and format the dream summary from gathered topics or active dream
+        if dream_topics:
+            # Pick the most salient 1-2 topics
+            if len(dream_topics) == 1:
+                return dream_topics[0]
+            return f"{dream_topics[0]} and {dream_topics[1]}"
+
+        if self.notes_written > 0:
+            return f"consolidation of {self.notes_written} memory pathways"
+
+        return "memory recalibration and silent system telemetry"
 
     async def _explore_curiosity_online(self, question: str, episode_id: str) -> Optional[dict]:
         """Answer question using web tools or remote model."""

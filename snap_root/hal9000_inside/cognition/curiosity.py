@@ -60,17 +60,18 @@ class CuriosityEngine:
         recent_turns: List[dict] = []
         if hasattr(self.memory, "get_recent_turns"):
             try:
-                recent_turns = self.memory.get_recent_turns(limit=10, session_id=session_id)
+                recent_turns = self.memory.get_recent_turns(limit=15, session_id=session_id)
             except Exception as e:
                 logger.debug(f"Could not retrieve recent turns: {e}")
 
         recent_memories: List[dict] = []
+        all_mems: List[dict] = []
         if hasattr(self.memory, "inspect_all"):
             try:
                 all_mems = self.memory.inspect_all()
                 # Sort by updated_at or created_at descending
                 sorted_mems = sorted(all_mems, key=lambda m: m.get("updated_at") or m.get("created_at") or "", reverse=True)
-                recent_memories = sorted_mems[:10]
+                recent_memories = sorted_mems[:12]
             except Exception as e:
                 logger.debug(f"Could not inspect memories: {e}")
 
@@ -81,12 +82,25 @@ class CuriosityEngine:
         for m in recent_memories:
             context_lines.append(f"Memory: {m.get('text', '')}")
 
+        # Also pull a few random/older memories to spark cross-domain curiosity if available
+        if len(all_mems) > 12:
+            import random
+            older_sample = random.sample(all_mems[12:], min(5, len(all_mems) - 12))
+            for m in older_sample:
+                context_lines.append(f"Past knowledge: {m.get('text', '')}")
+
         context_text = "\n".join(context_lines).strip()
         new_questions: List[str] = []
 
         # 2. If LLM is available, generate thoughtful investigative questions
         if self.llm and context_text:
             try:
+                # Include recently completed questions so LLM avoids repeating them
+                completed_sample = self.completed_questions[-10:] if self.completed_questions else []
+                avoid_clause = ""
+                if completed_sample:
+                    avoid_clause = f" Do NOT duplicate or re-ask these previously investigated questions: {json.dumps(completed_sample)}."
+
                 prompt = [
                     {
                         "role": "system",
@@ -95,7 +109,8 @@ class CuriosityEngine:
                             "Based on the previous conversations and stored memory context provided, "
                             f"generate {needed} insightful, open investigative questions that HAL should explore or research. "
                             "These should probe deeper into topics discussed, resolve uncertainties, explore related scientific or factual domains, "
-                            "or investigate implications. "
+                            "or investigate unexpected implications."
+                            f"{avoid_clause} "
                             "Output strictly valid JSON: a JSON array of strings, e.g. [\"question 1?\", \"question 2?\"]. "
                             "Do not include Markdown fencing, explanation, or notes outside the JSON array."
                         ),
@@ -123,25 +138,57 @@ class CuriosityEngine:
                 if isinstance(parsed, list):
                     for q in parsed:
                         if isinstance(q, str) and q.strip():
-                            new_questions.append(q.strip())
+                            cq = q.strip()
+                            if cq not in self.question_queue and cq not in self.completed_questions and cq not in new_questions:
+                                new_questions.append(cq)
             except Exception as e:
                 logger.debug(f"LLM curiosity self-generation failed: {e}")
 
-        # 3. Fallback heuristic generation if LLM unavailable or yielded insufficient questions
+        # 3. Dynamic heuristic generation if LLM unavailable or yielded insufficient questions
         if len(self.question_queue) + len(new_questions) < min_count:
-            # Extract topics/entities from turns & memories
-            heuristics = [
-                "What are the latest developments and scientific consensus on the topics discussed?",
-                "What foundational historical background led to the recent subjects raised by the user?",
-                "What related technologies, missions, or theoretical models connect to our recent discussions?",
-                "What are potential operational challenges or open research questions regarding our recent topics?",
-                "What key reference materials or encyclopedic facts further clarify our conversation context?",
+            # Extract key subjects or entities from recent memories/turns
+            topic_candidates = []
+            import re
+            for m in (recent_memories or all_mems[:5]):
+                txt = m.get("text", "")
+                # Find capitalized words or noun phrases
+                words = [w for w in re.findall(r'\b[A-Z][a-zA-Z0-9_\-]{2,}\b', txt) if w.lower() not in ("what", "hal", "dave", "discovery", "user")]
+                topic_candidates.extend(words)
+
+            import time as _t
+            epoch_cycle = int(_t.time() // 60)
+            base_templates = [
+                "What are the foundational principles and technical architecture of {topic}?",
+                "What recent empirical studies or benchmarks evaluate {topic}?",
+                "What are the primary operational challenges and failure modes associated with {topic}?",
+                "How does {topic} compare to alternative historical or modern paradigms?",
+                "What are the emerging standards or open research questions regarding {topic}?",
+                "What computational requirements and optimization techniques apply to {topic}?",
+                "What cross-disciplinary applications connect {topic} to autonomous systems?",
             ]
-            for h in heuristics:
+
+            topics_to_use = list(dict.fromkeys(topic_candidates)) or ["autonomous systems", "distributed computing", "neural architectures", "cognitive consolidation", "planetary science"]
+            
+            for i, tmpl in enumerate(base_templates):
                 if len(self.question_queue) + len(new_questions) >= min_count:
                     break
+                topic = topics_to_use[(epoch_cycle + i) % len(topics_to_use)]
+                h = tmpl.format(topic=topic)
                 if h not in self.question_queue and h not in self.completed_questions and h not in new_questions:
                     new_questions.append(h)
+
+            # Secondary generic fallback if still needed
+            if len(self.question_queue) + len(new_questions) < min_count:
+                fallback_templates = [
+                    f"What are key developments in science and engineering relevant to cycle {epoch_cycle}?",
+                    f"What foundational models or theories are currently being evaluated in cycle {epoch_cycle}?",
+                    f"What operational anomalies or open problems should HAL investigate for cycle {epoch_cycle}?",
+                ]
+                for fb in fallback_templates:
+                    if len(self.question_queue) + len(new_questions) >= min_count:
+                        break
+                    if fb not in self.question_queue and fb not in self.completed_questions and fb not in new_questions:
+                        new_questions.append(fb)
 
         self.enqueue_questions(new_questions)
         logger.info(f"HAL generated {len(new_questions)} autonomous curiosity questions (total pending: {len(self.question_queue)})")

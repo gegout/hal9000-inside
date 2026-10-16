@@ -308,3 +308,19 @@ class LLMRouter:
             return res, "remote", self.remote_client.model
 
         raise RuntimeError("No LLM client configured for generation.")
+
+    async def generate_response(
+        self,
+        messages: List[Dict[str, str]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        return_dict: bool = False,
+        max_tokens: int = 1024,
+    ) -> Any:
+        """Compatibility method matching LLMClient interface. Delegates to generate()."""
+        res, _, _ = await self.generate(
+            messages=messages,
+            tools=tools,
+            return_dict=return_dict,
+            max_tokens=max_tokens,
+        )
+        return res
