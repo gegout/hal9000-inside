@@ -530,7 +530,67 @@ class TestSleepMode(unittest.TestCase):
         finally:
             loop.close()
 
+    def test_sleep_generates_one_dream_per_minute(self):
+        """HAL 9000 generates 1 dream per minute (every 60s) continuously while sleeping."""
+        fake_clock = FakeClock(initial_time=5000.0)
+        fake_embedder = FakeEmbedder()
+        store = MemoryStore(data_dir=self.temp_dir, embedder=fake_embedder)
+        budget = SleepBudget(max_minutes=10.0)
+
+        manager = SleepManager(
+            memory_store=store,
+            curiosity_engine=None,
+            mcp_client=None,
+            budget=budget,
+            clock=fake_clock,
+        )
+
+        dreams_observed = []
+        def dream_tracker(done, total, notes, online, left, dream=None):
+            if dream and (not dreams_observed or dreams_observed[-1] != dream):
+                dreams_observed.append(dream)
+
+        loop = asyncio.new_event_loop()
+        try:
+            async def run_dreaming_test():
+                task = asyncio.create_task(manager.run_sleep_cycle(ui_callback=dream_tracker))
+                await asyncio.sleep(0.15)
+                # At minute 0 (cycle start), 1 initial dream generated
+                self.assertEqual(len(dreams_observed), 1)
+
+                # Advance 30s: still 1 dream
+                fake_clock.advance(30.0)
+                await asyncio.sleep(0.15)
+                self.assertEqual(len(dreams_observed), 1)
+
+                # Advance 31s (total 61s >= 60s): 2nd dream generated
+                fake_clock.advance(31.0)
+                await asyncio.sleep(0.15)
+                self.assertEqual(len(dreams_observed), 2)
+
+                # Advance another 60s (total 121s): 3rd dream generated
+                fake_clock.advance(60.0)
+                await asyncio.sleep(0.15)
+                self.assertEqual(len(dreams_observed), 3)
+
+                # Advance another 60s (total 181s): 4th dream generated
+                fake_clock.advance(60.0)
+                await asyncio.sleep(0.15)
+                self.assertEqual(len(dreams_observed), 4)
+
+                manager.request_wake()
+                summary = await task
+                self.assertEqual(len(summary.dreams), 4)
+                self.assertIsNotNone(summary.dream_summary)
+                return summary
+
+            summary = loop.run_until_complete(run_dreaming_test())
+            self.assertEqual(len(summary.dreams), 4)
+        finally:
+            loop.close()
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

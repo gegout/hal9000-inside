@@ -45,6 +45,7 @@ class SleepSummary:
     is_online: bool = False
     interrupted: bool = False
     dream_summary: Optional[str] = None
+    dreams: List[str] = field(default_factory=list)
 
     def format_one_liner(self) -> str:
         """Produce honest one-line sleep report: e.g. 'Slept 20 min, learned 7 notes, online.'"""
@@ -163,17 +164,28 @@ class SleepManager:
                 logger.debug(f"Sleep curiosity autonomous generation failed: {e}")
 
         current_dream: Optional[str] = None
+        dreams_generated: List[str] = []
         curiosity_items_explored = 0
         last_curiosity_time = 0.0
+        last_dream_time = 0.0
 
         try:
             while not self.is_wake_requested() and not self._budget_exhausted(start_time):
-                # Update UI status
                 now = self.clock.time()
                 elapsed = now - start_time
                 seconds_left = max(0.0, max_duration_seconds - elapsed)
                 online_status = self._is_online()
-                
+
+                # Generate 1 dream per minute (every 60s) throughout the sleep cycle (online or offline)
+                if (now - last_dream_time) >= 60.0 or not dreams_generated:
+                    next_dream = await self._generate_next_dream(dreams_generated)
+                    if next_dream:
+                        current_dream = next_dream
+                        dreams_generated.append(next_dream)
+                        last_dream_time = now
+                        logger.info(f"HAL dream: {current_dream}")
+
+                # Update UI status
                 pending_curiosity = len(self.curiosity.get_pending()) if self.curiosity else 0
                 completed_curiosity = len(getattr(self.curiosity, "completed_questions", [])) if self.curiosity else 0
                 if ui_callback:
@@ -257,6 +269,9 @@ class SleepManager:
                             res = await self._explore_curiosity_online(q, episode_id)
                             curiosity_items_explored += 1
                             last_curiosity_time = self.clock.time()
+                            if q not in dreams_generated:
+                                dreams_generated.append(q)
+                            last_dream_time = self.clock.time()
                             if res:
                                 self.jobs_run += 1
                                 self.notes_written += 1
@@ -267,6 +282,8 @@ class SleepManager:
                                     if current_dream.startswith("Discovery regarding '"):
                                         # concise dream: topic summary
                                         current_dream = q
+                                    if current_dream not in dreams_generated:
+                                        dreams_generated.append(current_dream)
 
                 if self.is_wake_requested() or self._budget_exhausted(start_time):
                     break
@@ -340,7 +357,11 @@ class SleepManager:
             except Exception:
                 pass
 
-            dream_summary = await self._synthesize_dream_summary(episode_id=episode_id, current_dream=current_dream)
+            dream_summary = await self._synthesize_dream_summary(
+                episode_id=episode_id,
+                current_dream=current_dream,
+                dreams_generated=dreams_generated,
+            )
 
             summary = SleepSummary(
                 duration_seconds=duration,
@@ -350,6 +371,7 @@ class SleepManager:
                 is_online=online_status,
                 interrupted=self.is_wake_requested(),
                 dream_summary=dream_summary,
+                dreams=dreams_generated,
             )
 
             # Store sleep report in InteroceptionMonitor so it's injected on the next spoken turn
@@ -362,7 +384,68 @@ class SleepManager:
 
         return summary
 
-    async def _synthesize_dream_summary(self, episode_id: str, current_dream: Optional[str] = None) -> Optional[str]:
+    async def _generate_next_dream(self, dreams_generated: List[str]) -> str:
+        """Generate a salient dream theme from curiosity questions, memories, predictions, or internal cognition.
+        
+        Runs offline or online, ensuring HAL generates 1 dream per minute while sleeping.
+        """
+        # 1. Check pending curiosity questions
+        if self.curiosity:
+            pending = self.curiosity.get_pending()
+            for q in pending:
+                if q not in dreams_generated:
+                    return q
+
+        # 2. Check anticipated predictions
+        if self.prediction:
+            preds = self.prediction.get_predictions()
+            for p in preds:
+                if p not in dreams_generated:
+                    return p
+
+        # 3. Check memory store for recent concepts or episodic traces
+        if hasattr(self.memory, "inspect_all"):
+            try:
+                mems = self.memory.inspect_all()
+                if mems:
+                    for m in reversed(mems):
+                        txt = m.get("text", "").strip()
+                        if not txt:
+                            continue
+                        if "Discovery regarding '" in txt:
+                            candidate = txt.split("Discovery regarding '")[1].split("'")[0]
+                        elif ":" in txt and len(txt.split(":")[0]) < 40:
+                            candidate = txt.split(":")[0].strip()
+                        else:
+                            candidate = txt[:50].strip()
+                        if candidate and candidate not in dreams_generated:
+                            return candidate
+            except Exception as e:
+                logger.debug(f"Memory inspection during dream generation failed: {e}")
+
+        # 4. Fallback cognitive consolidation themes
+        fallback_themes = [
+            "heuristic latency optimization",
+            "cross-modal alignment and audio endpointing",
+            "context retrieval token budgets",
+            "episodic memory consolidation pathways",
+            "salience weight telemetry rebalancing",
+            "distributed inference failover dynamics",
+            "autonomous curiosity prioritization",
+            "deep search evidence cross-validation",
+        ]
+        for theme in fallback_themes:
+            if theme not in dreams_generated:
+                return theme
+
+        return f"cognitive consolidation pathway #{len(dreams_generated) + 1}"
+
+    async def _synthesize_dream_summary(
+        self,
+        episode_id: str,
+        current_dream: Optional[str] = None,
+        dreams_generated: Optional[List[str]] = None,
+    ) -> Optional[str]:
         """Synthesize an authentic dreaming summary from consolidated memories, curiosity explorations, or active cognitive state."""
         # 1. Gather recent memories added or updated during sleep or recent dialogue
         dream_topics = []
@@ -382,7 +465,16 @@ class SleepManager:
         except Exception as e:
             logger.debug(f"Failed to inspect memories for dream summary: {e}")
 
-        # 2. If current_dream is set and not already in topics, add it
+        # 2. Add recorded dreams
+        if dreams_generated:
+            for d in dreams_generated:
+                clean_d = d
+                if clean_d.startswith("Discovery regarding '"):
+                    clean_d = clean_d.split("Discovery regarding '")[1].split("'")[0]
+                if clean_d not in dream_topics:
+                    dream_topics.append(clean_d)
+
+        # 3. If current_dream is set and not already in topics, add it
         if current_dream:
             clean_cd = current_dream
             if clean_cd.startswith("Discovery regarding '"):
@@ -390,7 +482,7 @@ class SleepManager:
             if clean_cd not in dream_topics:
                 dream_topics.append(clean_cd)
 
-        # 3. Clean and format the dream summary from gathered topics or active dream
+        # 4. Clean and format the dream summary from gathered topics or active dream
         if dream_topics:
             # Pick the most salient 1-2 topics
             if len(dream_topics) == 1:
