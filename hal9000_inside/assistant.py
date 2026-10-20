@@ -1063,6 +1063,9 @@ class Hal9000Assistant:
                 fault_summary = f"Subsystem fault ({e})"
                 hal_reply = f"I am sorry{dave_tag}. I encountered an operational fault: {e}."
 
+            if getattr(self, "interoception", None):
+                self.interoception.record_error(fault_summary)
+
         else:
             # Turn succeeded without fatal exceptions -> clear or decay transient errors
             if getattr(self.interoception, "clear_error", None):

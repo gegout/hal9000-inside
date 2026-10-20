@@ -30,3 +30,14 @@ hal9000-inside = "hal9000_inside.cli.main:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["hal9000_inside*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+    "snap_root",
+    ".venv",
+    "build",
+    "dist",
+    "*.egg-info",
+]
+

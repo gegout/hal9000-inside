@@ -289,15 +289,25 @@ class TestSleepMode(unittest.TestCase):
         """hal9000-inside sleep --for 1 runs against a temp data dir with no audio devices and exits 0."""
         from hal9000_inside.cli.main import main
         import sys
+        from unittest import mock
+        import httpx
 
         old_argv = sys.argv
-        sys.argv = ["hal9000-inside", "sleep", "--for", "0.001", "--data-dir", self.temp_dir]
-        try:
-            with self.assertRaises(SystemExit) as cm:
-                main()
-            self.assertEqual(cm.exception.code, 0)
-        finally:
-            sys.argv = old_argv
+        sys.argv = ["hal9000-inside", "sleep", "--for", "0.0001", "--data-dir", self.temp_dir]
+        fake_server = FakeOpenAIServer()
+        fake_transport = fake_server.get_transport()
+
+        with mock.patch("httpx.AsyncClient", return_value=httpx.AsyncClient(transport=fake_transport)), \
+             mock.patch("hal9000_inside.mcp.MCPClientManager.call_tool", return_value="Mocked search answer"), \
+             mock.patch("hal9000_inside.cognition.CuriosityEngine.generate_autonomous_questions", return_value=[]):
+            try:
+                with self.assertRaises(SystemExit) as cm:
+                    main()
+                self.assertEqual(cm.exception.code, 0)
+            finally:
+                sys.argv = old_argv
+
+
 
 
 
