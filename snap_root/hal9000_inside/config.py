@@ -103,6 +103,8 @@ vad_silence_threshold_factor = 2.0# Dynamic threshold multiplier against baselin
 vad_min_silence_duration_ms = 900 # Silence duration required to endpoint speech turn
 vad_min_speech_duration_ms = 150  # Minimum speech duration to qualify as a turn
 half_duplex_cooldown_seconds = 0.6# Mute cooldown period following speech playback
+hpf_cutoff_hz = 100.0             # High-pass filter cutoff frequency in Hz (removes chassis rumble & DC)
+legacy_vad = false                # If true, roll back to legacy unfiltered VAD logic
 
 # Sublayer 4.3: Cognitive Sleep & Consolidation Budgets
 [engine.sleep]

@@ -38,6 +38,8 @@ class TerminalUI:
         "ERROR": "⚠️ ",          # Error
         "IDLE": "⏸️ ",           # Idle / paused
         "SLEEPING": "😴",       # Sleeping
+        "MUTED": "🔇",          # Microphone muted
+        "PTT": "🎙️ ",           # Push-to-Talk active
     }
 
     def __init__(self):
@@ -57,8 +59,9 @@ class TerminalUI:
         """Create a compact mic raw input gauge showing noise vs signal power."""
         gauge_width = 8
         snr = max(0.0, signal - noise_floor)
-        # Normalize roughly 0 to 400
-        filled = min(gauge_width, max(0, int((signal / 350.0) * gauge_width)))
+        # Adaptively normalize scale (default max 350.0, higher if elevated noise floor)
+        max_scale = max(noise_floor * 2.5, 350.0)
+        filled = min(gauge_width, max(0, int((signal / max_scale) * gauge_width)))
         
         # Color based on whether voice is active or background noise
         if is_speaking:
@@ -78,6 +81,7 @@ class TerminalUI:
         noise_floor: float,
         is_speaking: bool,
         text: str = "",
+        extra_status: str = "",
     ):
         """Render live compact status line with gauge, emoticon, and detected speech."""
         gauge = self.make_gauge(signal, noise_floor, is_speaking)
@@ -86,6 +90,8 @@ class TerminalUI:
         txt_display = ""
         if text.strip():
             txt_display = f" {BOLD}{WHITE}\"{text.strip()}\"{RESET}"
+        elif extra_status:
+            txt_display = f" {extra_status}"
         elif is_speaking:
             txt_display = f" {GREEN}(speaking...){RESET}"
 
@@ -114,11 +120,9 @@ class TerminalUI:
         dream_str = ""
         if dream:
             clean_dream = " ".join(dream.split()).strip()
-            # If dream is an inquiry or discovery text, keep it concise
+            # If dream is an inquiry or discovery text, clean leading prefix
             if clean_dream.startswith("Discovery regarding '"):
                 clean_dream = clean_dream[21:].split("'")[0]
-            if len(clean_dream) > 30:
-                clean_dream = clean_dream[:27] + "..."
             dream_str = f" · {MAGENTA}dreaming: \"{clean_dream}\"{RESET}"
 
         line = f"\r\033[K😴 {BOLD}{BLUE}Sleeping{RESET} · curiosity {curiosity_done}/{curiosity_total} · notes +{notes_added}{dream_str} · {conn_str}{time_str}"
@@ -126,7 +130,7 @@ class TerminalUI:
         sys.stdout.flush()
 
     def set_state(self, state: str, detail: str = ""):
-        """Update status emoticon when state changes (THINKING, RESPONDING, ERROR, SLEEPING)."""
+        """Update status emoticon when state changes (THINKING, RESPONDING, ERROR, SLEEPING, MUTED, PTT)."""
         self.current_state = state.upper()
         icon = self.STATUS_ICONS.get(self.current_state, "●")
         
@@ -141,6 +145,12 @@ class TerminalUI:
         elif self.current_state == "SLEEPING":
             icon = self.STATUS_ICONS["SLEEPING"]
             status_desc = f"{BLUE}Sleeping...{RESET}"
+        elif self.current_state == "MUTED":
+            icon = self.STATUS_ICONS["MUTED"]
+            status_desc = f"{YELLOW}Muted (press [M] to unmute){RESET}"
+        elif self.current_state == "PTT":
+            icon = self.STATUS_ICONS["PTT"]
+            status_desc = f"{GREEN}Push-to-Talk (listening... press [Space] to finish){RESET}"
         else:
             status_desc = detail
 

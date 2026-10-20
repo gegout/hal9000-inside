@@ -1,4 +1,5 @@
 from .manager import (
+    BiquadHighPass,
     SimpleVAD,
     HalfDuplexAudioController,
     AudioSink,
@@ -17,6 +18,7 @@ from .manager import (
 )
 
 __all__ = [
+    "BiquadHighPass",
     "SimpleVAD",
     "HalfDuplexAudioController",
     "AudioSink",

@@ -14,8 +14,59 @@ logger = logging.getLogger(__name__)
 TARGET_SAMPLE_RATE = 16000  # Parakeet STT input rate
 PIPER_SAMPLE_RATE = 22050   # Native Piper HAL 9000 output rate
 
+class BiquadHighPass:
+    """2nd-order Butterworth IIR high-pass filter with streaming state."""
+    def __init__(self, cutoff_hz: float = 100.0, sample_rate: int = 16000):
+        self.cutoff_hz = cutoff_hz
+        self.sample_rate = sample_rate
+        self.enabled = cutoff_hz > 0.0
+        
+        if self.enabled:
+            # Bilinear transform of analog 2nd-order Butterworth HPF
+            w0 = math.tan(math.pi * cutoff_hz / sample_rate)
+            k = math.sqrt(2.0) * w0
+            denom = 1.0 + k + w0 * w0
+            self.b0 = 1.0 / denom
+            self.b1 = -2.0 / denom
+            self.b2 = 1.0 / denom
+            self.a1 = 2.0 * (w0 * w0 - 1.0) / denom
+            self.a2 = (1.0 - k + w0 * w0) / denom
+        else:
+            self.b0 = 1.0
+            self.b1 = self.b2 = self.a1 = self.a2 = 0.0
+
+        self.x1 = self.x2 = self.y1 = self.y2 = 0.0
+
+    def process(self, frame_bytes: bytes) -> bytes:
+        """Filter 16-bit mono PCM bytes while updating filter state continuously."""
+        if not self.enabled or not frame_bytes:
+            return frame_bytes
+
+        samples = np.frombuffer(frame_bytes, dtype=np.int16).astype(np.float64)
+        if len(samples) == 0:
+            return frame_bytes
+
+        out = np.empty_like(samples)
+        b0, b1, b2, a1, a2 = self.b0, self.b1, self.b2, self.a1, self.a2
+        x1, x2, y1, y2 = self.x1, self.x2, self.y1, self.y2
+
+        for i in range(len(samples)):
+            x0 = samples[i]
+            y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+            x2, x1 = x1, x0
+            y2, y1 = y1, y0
+            out[i] = y0
+
+        self.x1, self.x2, self.y1, self.y2 = x1, x2, y1, y2
+        out_clipped = np.clip(out, -32768, 32767).astype(np.int16)
+        return out_clipped.tobytes()
+
+    def reset(self):
+        self.x1 = self.x2 = self.y1 = self.y2 = 0.0
+
+
 class SimpleVAD:
-    """Voice activity detector with DC-offset removal and adaptive noise-floor tracking."""
+    """Voice activity detector with DC-offset removal, speech-band filtering, and adaptive noise-floor tracking."""
     def __init__(
         self,
         sample_rate: int = 16000,
@@ -24,6 +75,8 @@ class SimpleVAD:
         silence_threshold_factor: float = 2.0,
         min_silence_duration_ms: int = 900,
         min_speech_duration_ms: int = 150,
+        hpf_cutoff_hz: float = 100.0,
+        legacy_mode: bool = False,
     ):
         self.sample_rate = sample_rate
         self.frame_samples = int(sample_rate * frame_duration_ms / 1000)
@@ -31,18 +84,29 @@ class SimpleVAD:
         self.min_silence_frames = int(min_silence_duration_ms / frame_duration_ms)
         self.min_speech_frames = int(min_speech_duration_ms / frame_duration_ms)
         self.threshold_factor = silence_threshold_factor
-        
+        self.legacy_mode = legacy_mode
+
+        # High-pass filter for VAD feature extraction
+        self.hpf = BiquadHighPass(cutoff_hz=0.0 if legacy_mode else hpf_cutoff_hz, sample_rate=sample_rate)
+
         self.noise_floor = 40.0  # baseline AC standard deviation
+        self._initial_calibration_frames = 0 if legacy_mode else 10  # first ~300ms calibrate noise floor
         self.speech_frame_count = 0
         self.silence_frame_count = 0
         self.is_speaking = False
         self.last_energy = 0.0
 
     def compute_energy(self, frame_bytes: bytes) -> float:
-        """Compute AC energy (standard deviation, removing any DC bias)."""
+        """Compute AC energy (standard deviation, removing DC bias and infrasound)."""
         if len(frame_bytes) < self.frame_samples * 2:
             return 0.0
-        samples = np.frombuffer(frame_bytes[:self.frame_samples * 2], dtype=np.int16)
+
+        if not self.legacy_mode:
+            filtered_bytes = self.hpf.process(frame_bytes[:self.frame_samples * 2])
+            samples = np.frombuffer(filtered_bytes, dtype=np.int16)
+        else:
+            samples = np.frombuffer(frame_bytes[:self.frame_samples * 2], dtype=np.int16)
+
         if len(samples) == 0:
             return 0.0
         return float(np.std(samples.astype(np.float64)))
@@ -51,8 +115,18 @@ class SimpleVAD:
         ac_energy = self.compute_energy(frame_bytes)
         self.last_energy = ac_energy
 
+        # Initial calibration phase: quickly converge noise floor during silence
+        if self._initial_calibration_frames > 0:
+            self._initial_calibration_frames -= 1
+            if self._initial_calibration_frames == 9:
+                self.noise_floor = ac_energy
+            else:
+                self.noise_floor = self.noise_floor * 0.7 + ac_energy * 0.3
+            return False
+
         # Dynamic threshold based on AC energy floor
-        threshold = max(90.0, self.noise_floor * self.threshold_factor)
+        min_thresh = 90.0 if self.legacy_mode else 70.0
+        threshold = max(min_thresh, self.noise_floor * self.threshold_factor)
         
         if ac_energy > threshold:
             return True
@@ -89,6 +163,7 @@ class SimpleVAD:
         self.speech_frame_count = 0
         self.silence_frame_count = 0
         self.last_energy = 0.0
+        self.hpf.reset()
 
 
 def resample_pcm(pcm_bytes: bytes, in_rate: int, out_rate: int) -> bytes:
@@ -147,6 +222,10 @@ class HalfDuplexAudioController:
     @property
     def muted(self) -> bool:
         return self._muted
+
+    @property
+    def push_to_talk_active(self) -> bool:
+        return self._push_to_talk_active
 
     @property
     def is_playing(self) -> bool:

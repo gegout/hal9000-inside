@@ -72,6 +72,13 @@ class TestSleepMode(unittest.TestCase):
             tts=fake_tts,
             audio_sink=sink,
         )
+        assistant.curiosity.enqueue_questions([
+            "What is Europa?",
+            "What is Ganymede?",
+            "What is Callisto?",
+            "What is Io?",
+            "What is Jupiter?",
+        ])
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)

@@ -46,7 +46,7 @@ class CuriosityEngine:
     def get_pending(self) -> List[str]:
         return list(self.question_queue)
 
-    async def generate_autonomous_questions(self, min_count: int = 5, session_id: str = "default") -> List[str]:
+    async def generate_autonomous_questions(self, min_count: int = 5, session_id: Optional[str] = None) -> List[str]:
         """Self-generate curiosity questions based on previous discussions and memories.
 
         Ensures at least min_count items are in the queue for sleep learning.
@@ -96,10 +96,10 @@ class CuriosityEngine:
         if self.llm and context_text:
             try:
                 # Include recently completed questions so LLM avoids repeating them
-                completed_sample = self.completed_questions[-10:] if self.completed_questions else []
+                completed_sample = self.completed_questions[-15:] if self.completed_questions else []
                 avoid_clause = ""
                 if completed_sample:
-                    avoid_clause = f" Do NOT duplicate or re-ask these previously investigated questions: {json.dumps(completed_sample)}."
+                    avoid_clause = f" Do NOT duplicate, paraphrase, or re-ask these previously investigated questions: {json.dumps(completed_sample)}."
 
                 prompt = [
                     {
@@ -107,9 +107,9 @@ class CuriosityEngine:
                         "content": (
                             "You are the autonomous cognition and curiosity subsystem of HAL 9000. "
                             "Based on the previous conversations and stored memory context provided, "
-                            f"generate {needed} insightful, open investigative questions that HAL should explore or research. "
+                            f"generate {needed} unique, deeply insightful, open investigative questions that HAL should explore or research. "
                             "These should probe deeper into topics discussed, resolve uncertainties, explore related scientific or factual domains, "
-                            "or investigate unexpected implications."
+                            "or investigate unexpected implications. Ensure each question is distinct and explores a unique angle."
                             f"{avoid_clause} "
                             "Output strictly valid JSON: a JSON array of strings, e.g. [\"question 1?\", \"question 2?\"]. "
                             "Do not include Markdown fencing, explanation, or notes outside the JSON array."
@@ -120,7 +120,7 @@ class CuriosityEngine:
                         "content": f"Previous conversation and memory context:\n{context_text}\n\nGenerate {needed} curiosity questions:",
                     },
                 ]
-                reply = await self.llm.generate_response(prompt, max_tokens=300)
+                reply = await self.llm.generate_response(prompt, max_tokens=350)
                 text = str(reply).strip()
                 # Clean possible markdown fencing
                 if "```" in text:
@@ -149,46 +149,66 @@ class CuriosityEngine:
             # Extract key subjects or entities from recent memories/turns
             topic_candidates = []
             import re
+            for t in recent_turns:
+                txt = t.get("content", "")
+                words = [w for w in re.findall(r'\b[A-Za-z][a-zA-Z0-9_\-]{3,}\b', txt) if w.lower() not in (
+                    "what", "hal", "dave", "discovery", "user", "explain", "please", "would", "could", "should", "about", "this", "that", "with", "from", "have", "more"
+                )]
+                topic_candidates.extend(words)
+
             for m in (recent_memories or all_mems[:5]):
                 txt = m.get("text", "")
-                # Find capitalized words or noun phrases
                 words = [w for w in re.findall(r'\b[A-Z][a-zA-Z0-9_\-]{2,}\b', txt) if w.lower() not in ("what", "hal", "dave", "discovery", "user")]
                 topic_candidates.extend(words)
 
             import time as _t
-            epoch_cycle = int(_t.time() // 60)
-            base_templates = [
-                "What are the foundational principles and technical architecture of {topic}?",
-                "What recent empirical studies or benchmarks evaluate {topic}?",
-                "What are the primary operational challenges and failure modes associated with {topic}?",
-                "How does {topic} compare to alternative historical or modern paradigms?",
-                "What are the emerging standards or open research questions regarding {topic}?",
-                "What computational requirements and optimization techniques apply to {topic}?",
-                "What cross-disciplinary applications connect {topic} to autonomous systems?",
+            import random as _rand
+            epoch_cycle = int(_t.time())
+
+            curated_domains = [
+                "hydrodynamic foil cavitation and laminar flow boundary layers",
+                "open-source robotics middleware and zero-copy ROS message passing",
+                "non-volatile memory architectures and neuromorphic synaptic consolidation",
+                "multi-cluster Kubernetes resilient scheduling and eBPF network telemetry",
+                "computational thermodynamics of deep-sea marine exploration",
+                "epistemic uncertainty modeling and Bayesian self-calibration in autonomous systems",
+                "asynchronous consensus protocols and Byzantine fault tolerance in distributed state",
+                "quantum decoherence bounds in solid-state quantum computation",
+                "biological sleep architecture and replay mechanisms in hippocampal networks",
+                "enterprise sovereignty architectures and reproducible secure supply chains",
+                "gravitational wave interferometry and low-frequency cosmological signatures",
+                "aerodynamic foil trim angles and vortex shedding in light-wind flight",
+                "neuroplasticity and mindfulness meditation impacts on default mode networks",
+                "high-throughput edge tensor accelerators and integer quantization schemes",
+                "distributed Ceph object storage rebalancing under degraded network topologies",
+                "deep-sea saturation diving decompression algorithms and dissolved gas kinetics",
+                "reinforcement learning from verifiable human feedback and reward hacking mitigation",
+                "sub-surface oceanic thermocline circulation and planetary heat transport",
+                "vector retrieval indexing geometry and high-dimensional graph navigation",
+                "stochastic resonance in sensory perception and acoustic endpointing",
             ]
 
-            topics_to_use = list(dict.fromkeys(topic_candidates)) or ["autonomous systems", "distributed computing", "neural architectures", "cognitive consolidation", "planetary science"]
-            
-            for i, tmpl in enumerate(base_templates):
+            base_templates = [
+                "What empirical benchmarks and recent experiments evaluate {topic}?",
+                "What are the foundational principles, governing equations, and failure modes of {topic}?",
+                "How does {topic} compare to alternative modern paradigms in scientific engineering?",
+                "What emerging standards and unresolved research questions surround {topic}?",
+                "What computational constraints and optimization strategies govern {topic}?",
+                "What interdisciplinary connections link {topic} to autonomous cognitive architectures?",
+                "What operational anomalies and real-world edge cases emerge when implementing {topic}?",
+            ]
+
+            combined_topics = list(dict.fromkeys(topic_candidates)) + curated_domains
+            _rand.seed(epoch_cycle)
+            _rand.shuffle(combined_topics)
+
+            for topic in combined_topics:
                 if len(self.question_queue) + len(new_questions) >= min_count:
                     break
-                topic = topics_to_use[(epoch_cycle + i) % len(topics_to_use)]
+                tmpl = _rand.choice(base_templates)
                 h = tmpl.format(topic=topic)
                 if h not in self.question_queue and h not in self.completed_questions and h not in new_questions:
                     new_questions.append(h)
-
-            # Secondary generic fallback if still needed
-            if len(self.question_queue) + len(new_questions) < min_count:
-                fallback_templates = [
-                    f"What are key developments in science and engineering relevant to cycle {epoch_cycle}?",
-                    f"What foundational models or theories are currently being evaluated in cycle {epoch_cycle}?",
-                    f"What operational anomalies or open problems should HAL investigate for cycle {epoch_cycle}?",
-                ]
-                for fb in fallback_templates:
-                    if len(self.question_queue) + len(new_questions) >= min_count:
-                        break
-                    if fb not in self.question_queue and fb not in self.completed_questions and fb not in new_questions:
-                        new_questions.append(fb)
 
         self.enqueue_questions(new_questions)
         logger.info(f"HAL generated {len(new_questions)} autonomous curiosity questions (total pending: {len(self.question_queue)})")

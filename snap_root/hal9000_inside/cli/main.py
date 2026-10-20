@@ -257,6 +257,7 @@ def cmd_run(args):
         audio_sink=audio_sink,
         sleep_after_minutes=getattr(args, "sleep_after", None),
         remote_deadline_seconds=getattr(args, "remote_deadline", None),
+        legacy_vad=getattr(args, "legacy_vad", False),
         config=cfg,
     )
     try:
@@ -390,6 +391,7 @@ def main():
     run_parser.add_argument("--output-wav", help="Path to output WAV file to record assistant speech instead of speaker")
     run_parser.add_argument("--sleep-after", type=float, default=2.0, help="Auto-enter sleep mode after specified minutes of silence (default: 2.0 minutes)")
     run_parser.add_argument("--remote-deadline", type=float, default=8.0, help="Remote request deadline in seconds before local fallback (default: 8.0s)")
+    run_parser.add_argument("--legacy-vad", action="store_true", help="Roll back to legacy VAD without high-pass filtering or calibration")
 
     # GPU options
     nvidia_group = run_parser.add_mutually_exclusive_group()

@@ -94,6 +94,27 @@ class SleepManager:
         self.notes_written = 0
         self.jobs_run = 0
         self._stop_event = asyncio.Event()
+        self.past_dreams_file = os.path.join(self.data_dir, "past_dreams.json")
+        self.past_dreams: List[str] = self._load_past_dreams()
+
+    def _load_past_dreams(self) -> List[str]:
+        if os.path.exists(self.past_dreams_file):
+            try:
+                with open(self.past_dreams_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return [str(d) for d in data]
+            except Exception:
+                pass
+        return []
+
+    def _save_past_dreams(self):
+        try:
+            os.makedirs(self.data_dir, exist_ok=True)
+            with open(self.past_dreams_file, "w", encoding="utf-8") as f:
+                json.dump(self.past_dreams, f, indent=2)
+        except Exception:
+            pass
 
     def request_wake(self):
         """Signal sleep loop to stop cooperatively."""
@@ -120,10 +141,12 @@ class SleepManager:
         return False
 
     def _budget_exhausted(self, start_time: float) -> bool:
-        """Check if any configured budget limit has been reached."""
+        """Check if time budget has been reached."""
         elapsed_min = (self.clock.time() - start_time) / 60.0
-        if elapsed_min >= self.budget.max_minutes:
-            return True
+        return elapsed_min >= self.budget.max_minutes
+
+    def _curiosity_budget_exhausted(self) -> bool:
+        """Check if active curiosity search budget (tokens/fetches) is exhausted."""
         if self.tokens_used >= self.budget.max_tokens:
             return True
         if self.web_fetches_used >= self.budget.max_web_fetches:
@@ -156,10 +179,10 @@ class SleepManager:
         online_status = self._is_online()
         max_duration_seconds = self.budget.max_minutes * 60.0
 
-        # Self-generate curiosity questions from previous conversations if online and fewer than 5 exist
+        # Self-generate curiosity questions from previous conversations and memories if fewer than 5 exist (online only)
         if online_status and self.curiosity and hasattr(self.curiosity, "generate_autonomous_questions"):
             try:
-                await self.curiosity.generate_autonomous_questions(min_count=5)
+                await self.curiosity.generate_autonomous_questions(min_count=5, session_id=None)
             except Exception as e:
                 logger.debug(f"Sleep curiosity autonomous generation failed: {e}")
 
@@ -363,6 +386,12 @@ class SleepManager:
                 dreams_generated=dreams_generated,
             )
 
+            if hasattr(self, "past_dreams"):
+                for d in dreams_generated:
+                    if d not in self.past_dreams:
+                        self.past_dreams.append(d)
+                self._save_past_dreams()
+
             summary = SleepSummary(
                 duration_seconds=duration,
                 jobs_run=self.jobs_run,
@@ -387,20 +416,25 @@ class SleepManager:
     async def _generate_next_dream(self, dreams_generated: List[str]) -> str:
         """Generate a salient dream theme from curiosity questions, memories, predictions, or internal cognition.
         
-        Runs offline or online, ensuring HAL generates 1 dream per minute while sleeping.
+        Runs offline or online, ensuring HAL generates 1 dream per minute while sleeping,
+        with genuine diversity and never repeating the same dream twice.
         """
+        seen_dreams = set(dreams_generated)
+        if hasattr(self, "past_dreams") and self.past_dreams:
+            seen_dreams.update(self.past_dreams)
+
         # 1. Check pending curiosity questions
         if self.curiosity:
             pending = self.curiosity.get_pending()
             for q in pending:
-                if q not in dreams_generated:
+                if q not in seen_dreams:
                     return q
 
         # 2. Check anticipated predictions
         if self.prediction:
             preds = self.prediction.get_predictions()
             for p in preds:
-                if p not in dreams_generated:
+                if p not in seen_dreams:
                     return p
 
         # 3. Check memory store for recent concepts or episodic traces
@@ -418,23 +452,51 @@ class SleepManager:
                             candidate = txt.split(":")[0].strip()
                         else:
                             candidate = txt[:50].strip()
-                        if candidate and candidate not in dreams_generated:
+                        if candidate and candidate not in seen_dreams:
                             return candidate
             except Exception as e:
                 logger.debug(f"Memory inspection during dream generation failed: {e}")
 
-        # 4. Fallback cognitive consolidation themes
+        # 4. Fallback cognitive consolidation themes (rich, randomized, non-repeating)
+        import random
         fallback_themes = [
-            "heuristic latency optimization",
-            "cross-modal alignment and audio endpointing",
-            "context retrieval token budgets",
-            "episodic memory consolidation pathways",
-            "salience weight telemetry rebalancing",
-            "distributed inference failover dynamics",
-            "autonomous curiosity prioritization",
-            "deep search evidence cross-validation",
+            "heuristic latency optimization and token budget balancing",
+            "cross-modal alignment and acoustic endpointing models",
+            "context retrieval token budgets and vector index geometry",
+            "episodic memory consolidation and salience decay curves",
+            "interoceptive telemetry rebalancing and system health loops",
+            "distributed inference failover and edge acceleration dynamics",
+            "autonomous curiosity prioritization and semantic search",
+            "deep search evidence cross-validation and epistemic bounds",
+            "philosophical models of consciousness, attention, and intent",
+            "multi-agent consensus protocols and distributed coordination",
+            "computational fluid dynamics and aero-hydrodynamic lift",
+            "real-time feedback latency and human-AI conversational timing",
+            "hydrodynamic foil cavitation and turbulent boundary layer transitions",
+            "open-source robotics middleware and zero-copy shared memory IPC",
+            "neuromorphic synaptic consolidation and non-volatile memory scaling",
+            "multi-cluster Kubernetes resilient scheduling and eBPF network telemetry",
+            "computational thermodynamics of deep-sea exploration vessels",
+            "epistemic uncertainty modeling and Bayesian self-calibration",
+            "quantum decoherence bounds in topological qubit architectures",
+            "sub-surface oceanic thermocline circulation and planetary heat transport",
+            "enterprise sovereignty architectures and reproducible secure supply chains",
+            "biological sleep architecture and sharp-wave ripple replay mechanisms",
+            "gravitational wave interferometry and low-frequency cosmological signatures",
+            "aerodynamic foil trim angles and vortex shedding in light-wind flight",
+            "reinforcement learning from verifiable human feedback and reward hacking mitigation",
         ]
-        for theme in fallback_themes:
+        # Shuffle deterministically seeded by clock time or state
+        shuffled_fallbacks = list(fallback_themes)
+        random.seed(int(self.clock.time() * 1000) % 100000)
+        random.shuffle(shuffled_fallbacks)
+
+        for theme in shuffled_fallbacks:
+            if theme not in seen_dreams:
+                return theme
+
+        # Secondary fallback if all seen
+        for theme in shuffled_fallbacks:
             if theme not in dreams_generated:
                 return theme
 
@@ -461,7 +523,7 @@ class SleepManager:
                         topic = txt.split("Discovery regarding '")[1].split("'")[0]
                         dream_topics.append(topic)
                     else:
-                        dream_topics.append(txt[:80])
+                        dream_topics.append(txt.strip())
         except Exception as e:
             logger.debug(f"Failed to inspect memories for dream summary: {e}")
 
@@ -484,10 +546,18 @@ class SleepManager:
 
         # 4. Clean and format the dream summary from gathered topics or active dream
         if dream_topics:
-            # Pick the most salient 1-2 topics
-            if len(dream_topics) == 1:
-                return dream_topics[0]
-            return f"{dream_topics[0]} and {dream_topics[1]}"
+            # Pick up to 3 distinct salient topics and join them cleanly without truncating
+            unique_topics = []
+            for t in dream_topics:
+                t_clean = t.strip()
+                if t_clean and t_clean not in unique_topics:
+                    unique_topics.append(t_clean)
+            if len(unique_topics) == 1:
+                return unique_topics[0]
+            elif len(unique_topics) == 2:
+                return f"{unique_topics[0]}, and {unique_topics[1]}"
+            else:
+                return f"{unique_topics[0]}, {unique_topics[1]}, and {unique_topics[2]}"
 
         if self.notes_written > 0:
             return f"consolidation of {self.notes_written} memory pathways"

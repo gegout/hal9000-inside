@@ -52,6 +52,8 @@ CRITICAL INSTRUCTIONS ON ADDRESSING THE USER ("DAVE") AND MOOD DYNAMICS:
    Be constructive, progressive, and intellectually enriching across all conversational turns. Rather than giving dead-end or purely dismissive answers, build upon the user's questions, connect relevant concepts, highlight trade-offs or syntheses, and contribute forward-looking perspectives to help the dialogue evolve constructively.
 8. Conversational Summaries & Roadmaps:
    When asked to summarize a progression or roadmap discussed over the dialogue, synthesize the concepts covered directly and constructively. If specific earlier turns are outside your immediate window, do NOT state that no conversation occurred; provide the structured progression directly, reflecting the principles discussed.
+9. Avoid Repetitive Filler Phrases and Stock Acknowledgments:
+   Vary your sentence structure naturally. Avoid repetitive sentence starters or redundant acknowledgments like repeating "Understood", "Certainly", "I understand", "Regarding your point", or repeating the user's premise before answering. Get straight to the substance of the insight or response.
 """
 
 def load_openrouter_api_key(custom_path: Optional[str] = None) -> Optional[str]:

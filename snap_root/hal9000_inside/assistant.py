@@ -81,6 +81,8 @@ class Hal9000Assistant:
         sleep_after_minutes: Optional[float] = None,
         sleep_budget: Optional[SleepBudget] = None,
         remote_deadline_seconds: Optional[float] = None,
+        legacy_vad: Optional[bool] = None,
+        hpf_cutoff_hz: Optional[float] = None,
         config: Optional[Dict[str, Any]] = None,
     ):
         self.config = config or load_config()
@@ -176,6 +178,8 @@ class Hal9000Assistant:
         vad_thresh = float(cfg_audio.get("vad_silence_threshold_factor", 2.0))
         vad_min_silence = int(cfg_audio.get("vad_min_silence_duration_ms", 900))
         vad_min_speech = int(cfg_audio.get("vad_min_speech_duration_ms", 150))
+        vad_hpf_cutoff = float(hpf_cutoff_hz if hpf_cutoff_hz is not None else cfg_audio.get("hpf_cutoff_hz", 100.0))
+        vad_legacy = bool(legacy_vad if legacy_vad is not None else cfg_audio.get("legacy_vad", False))
         self.vad = SimpleVAD(
             sample_rate=vad_sr,
             frame_duration_ms=vad_frame_dur,
@@ -183,6 +187,8 @@ class Hal9000Assistant:
             silence_threshold_factor=vad_thresh,
             min_silence_duration_ms=vad_min_silence,
             min_speech_duration_ms=vad_min_speech,
+            hpf_cutoff_hz=vad_hpf_cutoff,
+            legacy_mode=vad_legacy,
         )
         self.interoception = InteroceptionMonitor()
         self.scheduler = CognitiveScheduler()
@@ -356,6 +362,7 @@ class Hal9000Assistant:
         preroll_buffer = collections.deque(maxlen=10)  # 300ms pre-roll at 30ms per frame
         last_speech_time = time.monotonic()
         last_meter_update = 0.0
+        was_ptt_active = self.audio_ctrl.push_to_talk_active
 
         try:
             async for frame in capture.stream_frames(frame_samples):
@@ -390,22 +397,75 @@ class Hal9000Assistant:
                     await self.enter_sleep()
                     continue
 
-                # Half-duplex gating: skip capture if HAL is speaking or in cooldown
+                # Half-duplex gating: skip capture if HAL is speaking or in cooldown, or mic is muted
                 if not self.audio_ctrl.can_capture():
+                    if len(current_audio_buffer) > 0:
+                        # If PTT was just deactivated while buffer has speech, process it
+                        if was_ptt_active and len(current_audio_buffer) > 16000 * 2 * 0.4:
+                            last_speech_time = time.monotonic()
+                            audio_to_transcribe = bytes(current_audio_buffer)
+                            current_audio_buffer.clear()
+                            preroll_buffer.clear()
+                            self.vad.reset()
+                            was_ptt_active = False
+
+                            self.scheduler.on_turn_start()
+                            self._turn_active = True
+                            try:
+                                await self._handle_turn(audio_to_transcribe)
+                            finally:
+                                self._turn_active = False
+                                self.scheduler.on_turn_end()
+                                last_speech_time = time.monotonic()
+                            capture.purge_buffered()
+                            self.ui.set_state("LISTENING")
+                            continue
+
+                    was_ptt_active = self.audio_ctrl.push_to_talk_active
                     current_audio_buffer.clear()
                     preroll_buffer.clear()
                     self.vad.reset()
                     continue
 
+                # Detect PTT release transition even while can_capture might still be evaluated
+                if was_ptt_active and not self.audio_ctrl.push_to_talk_active:
+                    was_ptt_active = False
+                    if len(current_audio_buffer) > 16000 * 2 * 0.4:
+                        last_speech_time = time.monotonic()
+                        audio_to_transcribe = bytes(current_audio_buffer)
+                        current_audio_buffer.clear()
+                        preroll_buffer.clear()
+                        self.vad.reset()
+
+                        self.scheduler.on_turn_start()
+                        self._turn_active = True
+                        try:
+                            await self._handle_turn(audio_to_transcribe)
+                        finally:
+                            self._turn_active = False
+                            self.scheduler.on_turn_end()
+                            last_speech_time = time.monotonic()
+                        capture.purge_buffered()
+                        self.ui.set_state("LISTENING")
+                        continue
+
+                was_ptt_active = self.audio_ctrl.push_to_talk_active
                 is_speaking, utterance_finished, energy = self.vad.process_frame(frame)
 
                 # Show live compact status line periodically (every ~70ms)
                 now = time.monotonic()
                 if now - last_meter_update > 0.07:
+                    extra_tag = ""
+                    if self.audio_ctrl.push_to_talk_active:
+                        extra_tag = "\033[32m[PTT ACTIVE]\033[0m"
+                    elif self.audio_ctrl.muted:
+                        extra_tag = "\033[33m[MUTED]\033[0m"
+
                     self.ui.update_live_status(
                         signal=energy,
                         noise_floor=self.vad.noise_floor,
                         is_speaking=is_speaking,
+                        extra_status=extra_tag,
                     )
                     last_meter_update = now
 
@@ -467,6 +527,32 @@ class Hal9000Assistant:
             except Exception:
                 pass
             self.ui.restore()
+
+    async def shutdown(self):
+        """Cleanly close network sessions, monitors, and clients."""
+        self.running = False
+        try:
+            if hasattr(self, "router") and hasattr(self.router, "connectivity"):
+                self.router.connectivity.stop()
+        except Exception:
+            pass
+        try:
+            await self.mcp.close()
+        except Exception:
+            pass
+        try:
+            await self.wiki.close()
+        except Exception:
+            pass
+        try:
+            await self.knowledge.close()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "ui"):
+                self.ui.restore()
+        except Exception:
+            pass
 
     async def _handle_turn(self, pcm_data: bytes):
         """Process one completed spoken turn with telemetry and honest self-state."""
@@ -1339,8 +1425,24 @@ class Hal9000Assistant:
                     self.playback.stop()
                     self.audio_ctrl.notify_playback_stopped()
                     self.ui.set_state("LISTENING")
-                elif ch == ' ':  # Space (Push-to-Talk or trigger)
-                    pass
+                elif ch in ('m', 'M'):  # Toggle microphone mute
+                    is_muted = not self.audio_ctrl.muted
+                    self.audio_ctrl.set_muted(is_muted)
+                    if is_muted:
+                        self.ui.set_state("MUTED")
+                    else:
+                        self.ui.set_state("LISTENING", "Microphone unmuted")
+                elif ch == ' ':  # Space (Push-to-Talk toggle or manual utterance trigger)
+                    # If currently muted, un-mute first
+                    if self.audio_ctrl.muted:
+                        self.audio_ctrl.set_muted(False)
+
+                    is_ptt = not self.audio_ctrl.push_to_talk_active
+                    self.audio_ctrl.set_push_to_talk(is_ptt)
+                    if is_ptt:
+                        self.ui.set_state("PTT")
+                    else:
+                        self.ui.set_state("LISTENING")
         except Exception:
             pass
         finally:
