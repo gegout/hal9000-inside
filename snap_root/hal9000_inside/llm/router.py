@@ -18,6 +18,7 @@ from hal9000_inside.llm.client import (
     DEFAULT_MODEL,
     FALLBACK_MODEL,
     LLMClient,
+    LocalModelExecutionError,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,7 @@ class LLMRouter:
         self._just_fell_back: bool = False
         self.last_remote_error: Optional[Exception] = None
         self.last_local_error: Optional[Exception] = None
+        self.local_backoff_until: float = 0.0
 
     def record_remote_result(self, latency_ms: float, error: bool = False, unreachable: bool = False):
         self.remote_latencies.append(latency_ms)
@@ -152,6 +154,9 @@ class LLMRouter:
             return "remote"
         if not self.remote_client or not self.remote_client.is_configured:
             return "local"
+        # If local model is in backoff due to local execution error, prefer remote
+        if time.time() < self.local_backoff_until and self.remote_client and self.remote_client.is_configured:
+            return "remote"
         # If in unreachable cooldown, stay local
         if self.is_remote_unreachable and self.cooldown_remaining > 0:
             return "local"
@@ -248,6 +253,7 @@ class LLMRouter:
                         res = await local_task
                     except Exception as le:
                         self.last_local_error = le
+                        self.local_backoff_until = time.time() + 60.0
                         logger.warning(f"Local LLM fallback failed ({le}).")
                         if cb_task and not cb_task.done():
                             try:
@@ -290,8 +296,9 @@ class LLMRouter:
                 return res, "local", self.local_client.model
             except Exception as le:
                 self.last_local_error = le
+                self.local_backoff_until = time.time() + 60.0
                 logger.warning(f"Local LLM execution failed ({le}). Trying remote backup if available.")
-                if self.remote_client and self.remote_client.is_configured and not self.force_local:
+                if self.remote_client and self.remote_client.is_configured:
                     try:
                         res = await self.remote_client.generate_response(
                             messages, tools=tools, return_dict=return_dict, max_tokens=max_tokens

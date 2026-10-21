@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import time
 import unittest
+from unittest.mock import MagicMock
 import httpx
 
 from hal9000_inside.assistant import Hal9000Assistant
@@ -479,6 +480,45 @@ class TestRemoteFallback(unittest.TestCase):
             spoken_text = " ".join(fake_tts.synthesized_texts)
             self.assertIn("Diagnostics indicate the following status, Dave", spoken_text)
             self.assertIn("External databanks unreachable", spoken_text)
+        finally:
+            loop.close()
+
+    def test_local_mediapipe_invalid_argument_seamless_failover(self):
+        """When local LLM raises LocalModelExecutionError / Mediapipe HTTP 400, fallback to remote seamlessly."""
+        from hal9000_inside.llm.client import LocalModelExecutionError
+        fake_remote = FakeOpenAIServer()
+        fake_remote.enqueue_response("Remote backup response.")
+
+        remote_client = LLMClient(
+            model="remote-model",
+            api_key="sk-test",
+            transport=fake_remote.get_transport(),
+            timeout_seconds=2.0,
+            max_retries=1,
+        )
+
+        # Mock local client to raise LocalModelExecutionError matching Mediapipe error
+        local_client = MagicMock()
+        async def mock_local_gen(*args, **kwargs):
+            raise LocalModelExecutionError(
+                'Local LLM execution error (HTTP 400): {"error":"Mediapipe execution failed. MP status - INVALID_ARGUMENT"}',
+                status_code=400,
+            )
+        local_client.generate_response = mock_local_gen
+        local_client.is_configured = True
+        local_client.model = "gemma4-e4b-ov"
+
+        router = LLMRouter(remote_client=remote_client, local_client=local_client, force_local=True)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            # Route is initially local because force_local is set, but on failure it transparently fails over to remote
+            res, route, model = loop.run_until_complete(router.generate([{"role": "user", "content": "ping"}]))
+            self.assertEqual(route, "remote")
+            self.assertEqual(model, "remote-model")
+            self.assertIn("Remote backup response", res)
+            self.assertTrue(router.local_backoff_until > time.time())
         finally:
             loop.close()
 

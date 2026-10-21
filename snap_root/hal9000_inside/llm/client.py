@@ -17,6 +17,13 @@ class RemoteUnreachableError(Exception):
         self.status_code = status_code
         self.cause = cause
 
+class LocalModelExecutionError(RuntimeError):
+    """Raised when the local LLM runtime encounters an internal inference or configuration fault."""
+    def __init__(self, message: str, status_code: Optional[int] = None, cause: Optional[Exception] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.cause = cause
+
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 # Small instruction model with strong English dialogue and reliable structured output
 DEFAULT_MODEL = "google/gemini-2.5-flash-lite"
@@ -241,6 +248,8 @@ class LLMClient:
                         if resp.status_code == 400 and "reasoning is mandatory" in err_text.lower() and payload.get("reasoning", {}).get("effort") == "none":
                             payload["reasoning"] = {"effort": "low"}
                             continue
+                        if self.is_local:
+                            raise LocalModelExecutionError(f"{prefix} execution error (HTTP {resp.status_code}): {err_text}", status_code=resp.status_code)
                         raise RuntimeError(f"{prefix} request failed (HTTP {resp.status_code}): {err_text}")
                     data = resp.json()
                     msg = data["choices"][0]["message"]
@@ -303,7 +312,10 @@ class LLMClient:
                     raise PermissionError(f"{prefix} Authentication failed: Invalid API key (HTTP 401).")
                 if response.status_code != 200:
                     err_body = await response.aread()
-                    raise RuntimeError(f"{prefix} stream error: HTTP {response.status_code} - {err_body.decode('utf-8', errors='ignore')}")
+                    err_text = err_body.decode('utf-8', errors='ignore')
+                    if self.is_local:
+                        raise LocalModelExecutionError(f"{prefix} stream error (HTTP {response.status_code}): {err_text}", status_code=response.status_code)
+                    raise RuntimeError(f"{prefix} stream error: HTTP {response.status_code} - {err_text}")
 
                 async for line in response.aiter_lines():
                     line = line.strip()

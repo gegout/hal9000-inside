@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import time
 import unittest
+from unittest.mock import MagicMock
 import httpx
 
 from hal9000_inside.assistant import Hal9000Assistant
@@ -412,6 +413,116 @@ class TestRemoteFallback(unittest.TestCase):
         finally:
             loop.close()
 
+    def test_clear_spoken_diagnosis_when_both_models_fail(self):
+        """When both remote and local fail, HAL provides a clear specific diagnosis rather than a generic message."""
+        fake_remote = FakeOpenAIServer()
+        fake_remote.error_status = 503
+
+        fake_local = FakeOpenAIServer()
+        fake_local.error_status = 500
+
+        fake_embedder = FakeEmbedder()
+        real_store = MemoryStore(data_dir=self.temp_dir, embedder=fake_embedder)
+        fake_stt = FakeSTT(script=["Where are you?"])
+        fake_tts = FakeTTS()
+
+        remote_client = LLMClient(model="remote-model", api_key="sk-remote", max_retries=1, transport=fake_remote.get_transport())
+        local_client = LLMClient(model="local-model", api_key="sk-local", max_retries=1, transport=fake_local.get_transport())
+        router = LLMRouter(remote_client=remote_client, local_client=local_client)
+
+        assistant = Hal9000Assistant(
+            memory=real_store,
+            llm=router,
+            adapter=fake_stt,
+            tts=fake_tts,
+            audio_sink=NullSink(),
+        )
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            dummy_pcm = b"\x01\x00" * 16000
+            loop.run_until_complete(assistant._handle_turn(dummy_pcm))
+
+            # HAL should synthesize and speak the specific diagnosis
+            spoken_text = " ".join(fake_tts.synthesized_texts)
+            self.assertIn("External network databanks are unreachable, and the onboard local model is not responding.", spoken_text)
+            self.assertIsNotNone(assistant.interoception.last_error)
+            self.assertIn("External databanks unreachable", assistant.interoception.last_error)
+        finally:
+            loop.close()
+
+    def test_direct_status_command_when_models_down(self):
+        """HAL answers status queries directly in real time even when all models are down."""
+        fake_embedder = FakeEmbedder()
+        real_store = MemoryStore(data_dir=self.temp_dir, embedder=fake_embedder)
+        fake_stt = FakeSTT(script=["What is your status?"])
+        fake_tts = FakeTTS()
+
+        # No models configured / both down
+        router = LLMRouter(remote_client=None, local_client=None)
+
+        assistant = Hal9000Assistant(
+            memory=real_store,
+            llm=router,
+            adapter=fake_stt,
+            tts=fake_tts,
+            audio_sink=NullSink(),
+        )
+        assistant.interoception.record_error("External databanks unreachable")
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            dummy_pcm = b"\x01\x00" * 16000
+            loop.run_until_complete(assistant._handle_turn(dummy_pcm))
+
+            spoken_text = " ".join(fake_tts.synthesized_texts)
+            self.assertIn("Diagnostics indicate the following status, Dave", spoken_text)
+            self.assertIn("External databanks unreachable", spoken_text)
+        finally:
+            loop.close()
+
+    def test_local_mediapipe_invalid_argument_seamless_failover(self):
+        """When local LLM raises LocalModelExecutionError / Mediapipe HTTP 400, fallback to remote seamlessly."""
+        from hal9000_inside.llm.client import LocalModelExecutionError
+        fake_remote = FakeOpenAIServer()
+        fake_remote.enqueue_response("Remote backup response.")
+
+        remote_client = LLMClient(
+            model="remote-model",
+            api_key="sk-test",
+            transport=fake_remote.get_transport(),
+            timeout_seconds=2.0,
+            max_retries=1,
+        )
+
+        # Mock local client to raise LocalModelExecutionError matching Mediapipe error
+        local_client = MagicMock()
+        async def mock_local_gen(*args, **kwargs):
+            raise LocalModelExecutionError(
+                'Local LLM execution error (HTTP 400): {"error":"Mediapipe execution failed. MP status - INVALID_ARGUMENT"}',
+                status_code=400,
+            )
+        local_client.generate_response = mock_local_gen
+        local_client.is_configured = True
+        local_client.model = "gemma4-e4b-ov"
+
+        router = LLMRouter(remote_client=remote_client, local_client=local_client, force_local=True)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            # Route is initially local because force_local is set, but on failure it transparently fails over to remote
+            res, route, model = loop.run_until_complete(router.generate([{"role": "user", "content": "ping"}]))
+            self.assertEqual(route, "remote")
+            self.assertEqual(model, "remote-model")
+            self.assertIn("Remote backup response", res)
+            self.assertTrue(router.local_backoff_until > time.time())
+        finally:
+            loop.close()
+
 
 if __name__ == "__main__":
     unittest.main()
+

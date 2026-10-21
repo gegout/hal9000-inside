@@ -33,19 +33,21 @@ class TestParakeetLive(unittest.TestCase):
             yield PcmChunk(data=pcm_16k, format=FORMAT)
             yield PcmChunk(data=b"", format=FORMAT)
 
-        results = []
+        done_text = ""
+        finals = []
         async def mock_emit(ev):
+            nonlocal done_text
             if isinstance(ev, TranscriptionDone):
-                results.append(ev.text)
+                done_text = ev.text
             elif hasattr(ev, "text") and ev.text:
-                results.append(ev.text)
+                finals.append(ev.text)
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
             cfg = SessionConfig(audio_format=FORMAT)
             loop.run_until_complete(adapter.run_session(cfg, audio_gen(), mock_emit))
-            transcript = " ".join(results).strip()
+            transcript = done_text.strip() if done_text else " ".join(finals).strip()
             print(f"\nRecognized Live Parakeet Transcript: '{transcript}'\n")
             self.assertTrue(len(transcript) > 0)
             t_lower = transcript.lower()

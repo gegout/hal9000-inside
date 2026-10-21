@@ -708,15 +708,30 @@ def _default_model_dir() -> str:
     dev/parakeet/fetch_parakeet_onnx.py). The dev/ script is imported by path — it is
     not part of the installed package (snaps ship weights as components and
     always pass ``--model``)."""
+    # 1. Check well-known local cache or snap locations first
+    candidates = [
+        Path.home() / ".cache" / "myna" / "models" / "parakeet-tdt-0.6b-v3-int8",
+        Path(os.environ.get("SNAP_USER_DATA", "")) / ".cache" / "myna" / "models" / "parakeet-tdt-0.6b-v3-int8",
+        Path(os.environ.get("SNAP", "")) / "models" / "parakeet-tdt-0.6b-v3-int8",
+    ]
+    for c in candidates:
+        if (c / "encoder-model.int8.onnx").is_file():
+            return str(c)
+
     import importlib.util
 
     fetch = Path(__file__).resolve().parents[4] / "dev" / "parakeet" / "fetch_parakeet_onnx.py"
-    spec = importlib.util.spec_from_file_location("fetch_parakeet_onnx", fetch)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"no loader for {fetch}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return str(mod.stage(mod.default_model_dir()))
+    if fetch.is_file():
+        spec = importlib.util.spec_from_file_location("fetch_parakeet_onnx", fetch)
+        if spec is not None and spec.loader is not None:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return str(mod.stage(mod.default_model_dir()))
+
+    raise FileNotFoundError(
+        "Could not locate Parakeet model directory. Please ensure models are installed in ~/.cache/myna/models/parakeet-tdt-0.6b-v3-int8"
+    )
+
 
 
 class ParakeetAdapter:

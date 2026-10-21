@@ -57,5 +57,65 @@ class TestMemory(unittest.TestCase):
         self.assertEqual(turns[1]["role"], "assistant")
         self.assertEqual(turns[1]["content"], "Good afternoon, Dave.")
 
+    def test_schema_migration_v1_to_v2(self):
+        # Create a legacy v1 sqlite db directly
+        v1_dir = tempfile.mkdtemp()
+        try:
+            sqlite_path = os.path.join(v1_dir, "dialogue_history.db")
+            import sqlite3
+            with sqlite3.connect(sqlite_path) as conn:
+                conn.execute("""
+                    CREATE TABLE memories (
+                        id TEXT PRIMARY KEY,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        text TEXT NOT NULL,
+                        category TEXT,
+                        source_turn_id TEXT,
+                        is_active INTEGER DEFAULT 1
+                    )
+                """)
+                conn.execute("INSERT INTO memories VALUES ('mem-1', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'Test fact', 'fact', NULL, 1)")
+                conn.commit()
+
+            # Now open MemoryStore pointing to v1_dir; it should auto-migrate to v2
+            v2_store = MemoryStore(data_dir=v1_dir, embedder=self.store.embedder)
+            with sqlite3.connect(sqlite_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA table_info(memories)")
+                col_names = [r[1] for r in cursor.fetchall()]
+                self.assertIn("provenance", col_names)
+                self.assertIn("salience", col_names)
+                self.assertIn("confidence", col_names)
+                self.assertIn("access_count", col_names)
+                
+                cursor.execute("SELECT version FROM schema_version")
+                ver = cursor.fetchone()[0]
+                self.assertEqual(ver, 2)
+        finally:
+            shutil.rmtree(v1_dir, ignore_errors=True)
+
+    def test_v2_provenance_and_access_tracking(self):
+        mid = self.store.remember(
+            "Europa mission destination",
+            category="fact",
+            provenance="web",
+            salience=0.9,
+            confidence=0.95
+        )
+        results = self.store.search("Europa", limit=1)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["provenance"], "web")
+        self.assertEqual(results[0]["salience"], 0.9)
+        
+        # Verify access count incremented in SQLite
+        import sqlite3
+        with sqlite3.connect(self.store.sqlite_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT access_count, last_accessed_at FROM memories WHERE id = ?", (mid,))
+            row = cursor.fetchone()
+            self.assertEqual(row[0], 1)
+            self.assertIsNotNone(row[1])
+
 if __name__ == "__main__":
     unittest.main()
