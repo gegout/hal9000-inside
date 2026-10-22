@@ -356,7 +356,9 @@ def cmd_mcp(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HAL 9000 Inside - Ubuntu Voice Assistant")
+    from hal9000_inside import __version__
+    parser = argparse.ArgumentParser(description=f"HAL 9000 Inside v{__version__} - Ubuntu Voice Assistant")
+    parser.add_argument("--version", "-v", action="version", version=f"hal9000-inside {__version__}")
     parser.add_argument("--config", help="Custom path to config.toml (default: ~/.hal9000-inside/config.toml)")
     subparsers = parser.add_subparsers(dest="command", help="Subcommand to execute")
 

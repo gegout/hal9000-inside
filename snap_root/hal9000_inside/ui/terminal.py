@@ -49,8 +49,13 @@ class TerminalUI:
         self._progress_active = False
 
     def header(self):
+        try:
+            from hal9000_inside import __version__
+            version_str = f" v{__version__}"
+        except Exception:
+            version_str = ""
         print(f"{BOLD}{RED}======================================================{RESET}")
-        print(f"{BOLD}{RED}           HAL 9000 INSIDE - VOICE ASSISTANT          {RESET}")
+        print(f"{BOLD}{RED}       HAL 9000 INSIDE - VOICE ASSISTANT{version_str}       {RESET}")
         print(f"{BOLD}{WHITE}  \"Good afternoon, gentlemen. I am a HAL 9000 computer.\" {RESET}")
         print(f"{BOLD}{RED}======================================================{RESET}")
         print(f"{DIM}Controls: [Space] Push-to-Talk | [M] Mute | [C] Cancel | [S] Sleep | [Q] Quit{RESET}\n")
