@@ -25,9 +25,9 @@ class LocalModelExecutionError(RuntimeError):
         self.cause = cause
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
-# Small instruction model with strong English dialogue and reliable structured output
-DEFAULT_MODEL = "google/gemini-2.5-flash-lite"
-FALLBACK_MODEL = "openai/gpt-4o-mini"
+# ZDR-compliant, ultra-low-latency model with full tool-calling support
+DEFAULT_MODEL = "meta-llama/llama-3.3-70b-instruct"
+FALLBACK_MODEL = "qwen/qwen-2.5-72b-instruct"
 
 CONFIG_PATH = os.path.expanduser("~/.openrouter.config")
 
@@ -336,10 +336,9 @@ class LLMClient:
 
 
 TALKING_CANDIDATE_MODELS = [
-    "z-ai/glm-5.3-flash",
-    "google/gemini-3.8-flash",
-    "anthropic/claude-haiku-5.5",
-    "openai/gpt-6-luna",
+    "meta-llama/llama-3.3-70b-instruct",
+    "qwen/qwen-2.5-72b-instruct",
+    "deepseek/deepseek-chat",
 ]
 
 

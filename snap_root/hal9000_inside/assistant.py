@@ -303,7 +303,7 @@ class Hal9000Assistant:
             and not getattr(target_client, "is_local", False)
             and getattr(target_client, "is_configured", False)
         ):
-            self.ui.show_progress(4, total_steps, "Benchmarking model latency (GLM 5.3 Flash, Gemini 3.8 Flash, Haiku 5.5, GPT-6 Luna)...")
+            self.ui.show_progress(4, total_steps, "Benchmarking model latency (Llama 3.3 70B, Qwen 2.5 72B, DeepSeek Chat)...")
             try:
                 best = await select_fastest_talking_model(target_client)
                 if best:

@@ -86,8 +86,8 @@ parakeet_model_dir = "~/.cache/myna/models/parakeet-tdt-0.6b-v3-int8"
 # Sublayer 4.1: LLM Client & Router
 [engine.llm]
 remote_base_url = "https://openrouter.ai/api/v1"
-remote_model = "google/gemini-2.5-flash-lite"
-remote_fallback_model = "openai/gpt-4o-mini"
+remote_model = "meta-llama/llama-3.3-70b-instruct"
+remote_fallback_model = "qwen/qwen-2.5-72b-instruct"
 local_base_url = "http://127.0.0.1:8336/v3"
 local_model = "gemma4-e4b-ov"
 probe_interval_seconds = 15.0
