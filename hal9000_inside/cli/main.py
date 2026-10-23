@@ -113,7 +113,18 @@ def cmd_doctor(args):
     else:
         print("  [INFO] Intel GPU: None detected")
 
-    # 7. Storage & Memory Paths
+    # 7. SmolLM2 Local Service
+    from hal9000_inside.smollm2 import check_smollm2_snap_installed, sync_verify_smollm2_endpoint, DEFAULT_SMOLLM2_ENDPOINT
+    snap_ok = check_smollm2_snap_installed()
+    ep_ok, ep_err = sync_verify_smollm2_endpoint()
+    if snap_ok and ep_ok:
+        print("  [PASS] SmolLM2 local model service active: http://127.0.0.1:8344/v1")
+    elif snap_ok and not ep_ok:
+        print(f"  [WARN] SmolLM2 snap is installed but endpoint is not responding ({ep_err}).")
+    else:
+        print("  [INFO] SmolLM2 snap not installed. (Run: sudo snap install smollm2)")
+
+    # 8. Storage & Memory Paths
     storage_dir = os.path.expanduser(cfg_env.get("data_dir", "~/.local/share/hal9000-inside"))
     print(f"  [PASS] Memory storage directory: {storage_dir}")
 
@@ -245,6 +256,18 @@ def cmd_run(args):
     if getattr(args, "push_to_talk", False):
         auto_mode = False
 
+    combine_mode = bool(getattr(args, "combine", False) or cfg.get("cli", {}).get("combine", False))
+
+    if combine_mode:
+        from hal9000_inside.smollm2 import check_smollm2_snap_installed, sync_verify_smollm2_endpoint, get_smollm2_install_instruction
+        if not check_smollm2_snap_installed():
+            print("\n" + get_smollm2_install_instruction() + "\n")
+            # Do not exit; provide clear explanation and proceed or check if running elsewhere
+        ready, err = sync_verify_smollm2_endpoint()
+        if not ready:
+            print(f"[NOTE] SmolLM2 endpoint is not responding at http://127.0.0.1:8344/v1 ({err}).")
+            print("HAL will operate using remote model until local SmolLM2 service is available.")
+
     assistant = Hal9000Assistant(
         capture_device=args.device,
         playback_device=cfg.get("cli", {}).get("playback_device") or None,
@@ -258,6 +281,7 @@ def cmd_run(args):
         sleep_after_minutes=getattr(args, "sleep_after", None),
         remote_deadline_seconds=getattr(args, "remote_deadline", None),
         legacy_vad=getattr(args, "legacy_vad", False),
+        combine_mode=combine_mode,
         config=cfg,
     )
     try:
@@ -385,10 +409,11 @@ def main():
 
     # run
     run_parser = subparsers.add_parser("run", help="Start voice assistant interactive loop")
+    run_parser.add_argument("--combine", action="store_true", help="Enable combined local (SmolLM2) and remote concurrent inference")
     run_parser.add_argument("--push-to-talk", action="store_true", help="Enable push-to-talk instead of auto conversation mode")
     run_parser.add_argument("--device", help="ALSA capture device name (e.g. hw:CARD=Talk,DEV=0 or default)")
-    run_parser.add_argument("--model", help="OpenAI-compatible model ID override (e.g. gemma4-e4b-ov)")
-    run_parser.add_argument("--endpoint", help="OpenAI-compatible base URL override (e.g. http://127.0.0.1:8336/v3)")
+    run_parser.add_argument("--model", help="OpenAI-compatible model ID override (e.g. meta-llama/llama-3.3-70b-instruct or smollm2-135m)")
+    run_parser.add_argument("--endpoint", help="OpenAI-compatible base URL override (e.g. http://127.0.0.1:8344/v1)")
     run_parser.add_argument("--input-wav", help="Path to input WAV file to drive session from file instead of microphone")
     run_parser.add_argument("--output-wav", help="Path to output WAV file to record assistant speech instead of speaker")
     run_parser.add_argument("--sleep-after", type=float, default=2.0, help="Auto-enter sleep mode after specified minutes of silence (default: 2.0 minutes)")

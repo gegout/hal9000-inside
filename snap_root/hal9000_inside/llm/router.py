@@ -23,8 +23,8 @@ from hal9000_inside.llm.client import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LOCAL_ENDPOINT = "http://127.0.0.1:8336/v3"
-DEFAULT_LOCAL_MODEL = "gemma4-e4b-ov"
+DEFAULT_LOCAL_ENDPOINT = "http://127.0.0.1:8344/v1"
+DEFAULT_LOCAL_MODEL = "smollm2-135m"
 
 
 class ConnectivityMonitor:

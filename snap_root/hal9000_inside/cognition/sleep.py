@@ -135,7 +135,7 @@ class SleepManager:
             if hasattr(self.router, "connectivity") and self.router.connectivity:
                 return bool(self.router.connectivity.is_connected)
             return True
-        # If local client is configured (e.g. gemma on local endpoint) without force_local
+        # If local client is configured (e.g. smollm2 on local endpoint) without force_local
         if getattr(self.router, "local_client", None):
             return True
         return False

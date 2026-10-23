@@ -78,7 +78,7 @@ class TestAssistantEndToEnd(unittest.TestCase):
         real_store = MemoryStore(data_dir=self.temp_dir, embedder=fake_embedder)
         fake_stt = FakeSTT(script=["Where are we?"])
         fake_tts = FakeTTS()
-        local_client = LLMClient(model="local-gemma", base_url="http://127.0.0.1:8336/v3", api_key="sk-fake", transport=fake_local_server.get_transport())
+        local_client = LLMClient(model="smollm2-135m", base_url="http://127.0.0.1:8344/v1", api_key="sk-fake", transport=fake_local_server.get_transport())
 
         from hal9000_inside.llm import LLMRouter
         router = LLMRouter(remote_client=None, local_client=local_client, force_local=True)
@@ -109,7 +109,7 @@ class TestAssistantEndToEnd(unittest.TestCase):
                 cursor.execute("SELECT model_id, route FROM turn_telemetry")
                 rows = cursor.fetchall()
                 self.assertEqual(len(rows), 1)
-                self.assertEqual(rows[0][0], "local-gemma")
+                self.assertEqual(rows[0][0], "smollm2-135m")
                 self.assertEqual(rows[0][1], "local")
 
             self.assertFalse(assistant.audio_ctrl.is_playing)
@@ -131,7 +131,7 @@ class TestAssistantEndToEnd(unittest.TestCase):
         fake_tts = FakeTTS()
 
         remote_client = LLMClient(model="remote-deepseek", api_key="sk-remote", transport=fake_remote.get_transport())
-        local_client = LLMClient(model="local-gemma", api_key="sk-local", transport=fake_local.get_transport())
+        local_client = LLMClient(model="smollm2-135m", api_key="sk-local", transport=fake_local.get_transport())
 
         from hal9000_inside.llm import LLMRouter
         router = LLMRouter(remote_client=remote_client, local_client=local_client)
@@ -160,7 +160,7 @@ class TestAssistantEndToEnd(unittest.TestCase):
                 cursor.execute("SELECT model_id, route FROM turn_telemetry")
                 rows = cursor.fetchall()
                 self.assertEqual(len(rows), 1)
-                self.assertEqual(rows[0][0], "local-gemma")
+                self.assertEqual(rows[0][0], "smollm2-135m")
                 self.assertEqual(rows[0][1], "local")
         finally:
             loop.close()

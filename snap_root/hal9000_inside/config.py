@@ -31,6 +31,7 @@ DEFAULT_CONFIG_TOML = """# =====================================================
 [cli]
 auto_mode = true                  # Auto conversation mode with continuous voice detection (false = push-to-talk)
 push_to_talk = false              # Explicit push-to-talk key trigger mode
+combine = false                   # Combined local/remote inference mode (--combine)
 capture_device = ""               # ALSA capture device name (e.g. "hw:CARD=Talk,DEV=0" or "" for system default)
 playback_device = ""              # ALSA playback device name ("" for system default)
 input_wav = ""                    # Path to input WAV file to drive session from file instead of microphone
@@ -88,10 +89,12 @@ parakeet_model_dir = "~/.cache/myna/models/parakeet-tdt-0.6b-v3-int8"
 remote_base_url = "https://openrouter.ai/api/v1"
 remote_model = "meta-llama/llama-3.3-70b-instruct"
 remote_fallback_model = "qwen/qwen-2.5-72b-instruct"
-local_base_url = "http://127.0.0.1:8336/v3"
-local_model = "gemma4-e4b-ov"
+local_base_url = "http://127.0.0.1:8344/v1"
+local_model = "smollm2-135m"
 probe_interval_seconds = 15.0
 probe_timeout_seconds = 2.0
+local_word_limit = 20
+combine_mode = false
 
 # Sublayer 4.2: Audio & Voice Activity Detection (VAD)
 [engine.audio]
@@ -168,7 +171,13 @@ def load_config(config_path: str = CONFIG_PATH) -> Dict[str, Any]:
             user_config = tomllib.load(f)
         # Parse default config as base dictionary
         default_dict = tomllib.loads(DEFAULT_CONFIG_TOML)
-        return _deep_merge(default_dict, user_config)
+        merged = _deep_merge(default_dict, user_config)
+        # Safe migration: if old config refers to gemma or port 8336, migrate to SmolLM2 defaults
+        llm_cfg = merged.get("engine", {}).get("llm", {})
+        if "8336" in str(llm_cfg.get("local_base_url", "")) or "gemma" in str(llm_cfg.get("local_model", "")):
+            llm_cfg["local_base_url"] = "http://127.0.0.1:8344/v1"
+            llm_cfg["local_model"] = "smollm2-135m"
+        return merged
     except Exception as e:
         # Fall back to default dictionary if file is corrupted or cannot be read
         import logging

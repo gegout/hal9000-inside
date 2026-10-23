@@ -52,6 +52,8 @@ from hal9000_inside.tts import HalPiperTTS
 from hal9000_inside.ui import TerminalUI
 from myna.core import AudioFormat, PcmChunk, SessionConfig, TranscriptionDone
 from myna.testbed.parakeet import ParakeetAdapter
+from hal9000_inside.llm.intent import classify_turn_intent
+from hal9000_inside.speech_norm import count_spoken_words, validate_local_response
 
 from hal9000_inside.config import load_config
 from hal9000_inside.logging_config import setup_session_logging, log_dialogue_turn
@@ -83,6 +85,7 @@ class Hal9000Assistant:
         remote_deadline_seconds: Optional[float] = None,
         legacy_vad: Optional[bool] = None,
         hpf_cutoff_hz: Optional[float] = None,
+        combine_mode: Optional[bool] = None,
         config: Optional[Dict[str, Any]] = None,
     ):
         self.config = config or load_config()
@@ -94,6 +97,9 @@ class Hal9000Assistant:
         cfg_audio = cfg_engine.get("audio", {})
         cfg_sleep = cfg_engine.get("sleep", {})
         cfg_mem = cfg_engine.get("memory", {})
+
+        self.combine_mode = combine_mode if combine_mode is not None else bool(cfg_cli.get("combine", False) or cfg_llm.get("combine_mode", False))
+        self.local_word_limit = int(cfg_llm.get("local_word_limit", 20))
 
         # Compute device configuration
         eff_nvidia = use_nvidia if use_nvidia is not None else cfg_cli.get("enable_nvidia", None)
@@ -162,7 +168,7 @@ class Hal9000Assistant:
             self.memory = MemoryStore(data_dir=data_dir, embedder=embedder)
         self.mcp = MCPClientManager()
         
-        # HAL Piper TTS
+        # HAL Piper TTS & Ordered Speech Queue
         if tts is not None:
             self.tts = tts
         else:
@@ -170,6 +176,21 @@ class Hal9000Assistant:
             tts_model = cfg_files.get("tts_model_path")
             tts_cfg = cfg_files.get("tts_config_path")
             self.tts = HalPiperTTS(model_path=tts_model, config_path=tts_cfg, use_cuda=tts_cuda)
+
+        from hal9000_inside.tts.speech_queue import OrderedSpeechQueue
+        from hal9000_inside.llm.smollm2_quick import SmolLM2QuickResponder
+        self.speech_queue = OrderedSpeechQueue(
+            tts=self.tts,
+            play_pcm_fn=lambda c: self.playback.play_pcm(c),
+            notify_start_fn=lambda: self.audio_ctrl.notify_playback_started(),
+            notify_stop_fn=lambda: self.audio_ctrl.notify_playback_stopped(),
+        )
+        self.smollm2_quick = SmolLM2QuickResponder(
+            endpoint=cfg_llm.get("local_base_url", "http://127.0.0.1:8344/v1"),
+            model=cfg_llm.get("local_model", "smollm2-135m"),
+            timeout_seconds=2.0,
+            max_words=self.local_word_limit,
+        )
 
         # VAD
         vad_sr = int(cfg_audio.get("sample_rate", 16000))
@@ -594,14 +615,19 @@ class Hal9000Assistant:
         if self.is_sleeping or self._cancel_current:
             return
 
-        # Check for direct assistant commands
+        # 2b. Intent Classification & Fast Social/Action Handling
+        turn_intent = classify_turn_intent(user_text)
+
+        # Immediate stop / cancel handling
         lower_u = user_text.lower()
-        if "cancel" in lower_u or "stop talking" in lower_u:
+        if "cancel" in lower_u or "stop talking" in lower_u or turn_intent == "action":
+            self.speech_queue.cancel()
             self.tts.cancel()
             self.playback.stop()
             log_dialogue_turn(speaker="HAL 9000", text="[User cancelled speech playback]", status="cancelled")
             return
 
+        # Check for direct assistant commands
         if any(p in lower_u for p in ("switch to local mode", "switch to local", "use local model", "enable local mode", "run locally")):
             self.router.force_local = True
             self.router.force_remote = False
@@ -671,6 +697,23 @@ class Hal9000Assistant:
             self.memory.record_turn("assistant", msg, session_id=self.current_episode_id or "default")
             log_dialogue_turn(speaker="HAL 9000", text=msg, route=route_name, model=self.router.model, status="diagnostics_reported")
             return
+
+        # In combine mode, handle pure social greetings locally via SmolLM2 under hard 20-word limit
+        if self.combine_mode and turn_intent == "social":
+            social_reply = await self.smollm2_quick.generate_social_reply(user_text)
+            if social_reply:
+                valid_social = validate_local_response(social_reply, max_words=self.local_word_limit)
+                if valid_social:
+                    self.ui.show_hal_reply(valid_social)
+                    self.speech_queue.reset()
+                    await self.speech_queue.speak_local_ack(valid_social)
+                    try:
+                        self.memory.record_turn("assistant", valid_social, session_id=self.current_episode_id or "default")
+                    except Exception as me:
+                        logger.warning(f"Failed to record social turn: {me}")
+                    log_dialogue_turn(speaker="HAL 9000", text=valid_social, route="local_smollm2", status="social_reply")
+                    self._enqueue_post_turn_cognition(user_text, valid_social)
+                    return
 
         # 3. Retrieve relevant conversational memory context
         t_ret_start = time.perf_counter()
@@ -759,10 +802,26 @@ class Hal9000Assistant:
             finally:
                 self.audio_ctrl.notify_playback_stopped()
 
+        # In combine mode, reset speech queue and concurrently spawn local quick acknowledgment
+        self.speech_queue.reset()
+        local_ack_task = None
+        if self.combine_mode:
+            async def _run_local_quick_ack():
+                try:
+                    ack = await self.smollm2_quick.generate_quick_ack(user_text)
+                    if ack and not self.speech_queue.remote_ready and not self._cancel_current and not self.is_sleeping:
+                        self.ui.show_hal_reply(f"[Local reflex] {ack}")
+                        await self.speech_queue.speak_local_ack(ack)
+                except Exception as ex:
+                    logger.debug(f"Local quick ack error: {ex}")
+
+            local_ack_task = asyncio.create_task(_run_local_quick_ack())
+
         try:
             resp_msg, used_route, used_model = await self.router.generate(
                 messages, tools=tools, return_dict=True, max_tokens=1024, on_fallback=_speak_fallback_ack
             )
+            self.speech_queue.mark_remote_ready()
             
             # Process model response and iterative tool executions (up to 3 iterations)
             tool_iterations = 0
@@ -1035,7 +1094,7 @@ class Hal9000Assistant:
 
             # Analyze error patterns across remote and local
             remote_failed = getattr(self.router, "is_remote_unreachable", False) or "remote" in err_str or "openrouter" in err_str or "unreachable" in err_str or bool(last_remote_str)
-            local_failed = "local" in err_str or "8336" in err_str or "connecterror" in err_str or bool(last_local_str)
+            local_failed = "local" in err_str or "8344" in err_str or "connecterror" in err_str or bool(last_local_str)
             dave_tag = ", Dave" if current_mood != "nominal" else ""
 
             if "401" in err_str or "authentication" in err_str:
@@ -1052,8 +1111,8 @@ class Hal9000Assistant:
                 hal_reply = f"I am sorry{dave_tag}. External network databanks are unreachable, and the onboard local model is not responding."
             elif self.router.is_local or local_failed:
                 fault_summary = "Local model processing failure"
-                if "connection refused" in err_str or "connecterror" in err_str or "8336" in err_str:
-                    hal_reply = f"I am sorry{dave_tag}. The onboard local model service at port 8336 is offline."
+                if "connection refused" in err_str or "connecterror" in err_str or "8344" in err_str:
+                    hal_reply = f"I am sorry{dave_tag}. The onboard local model service at port 8344 is offline."
                 else:
                     hal_reply = f"I am sorry{dave_tag}. The onboard model encountered an internal processing error."
             elif getattr(self.router, "is_remote_unreachable", False) or "unreachable" in err_str or "timeout" in err_str:
@@ -1098,33 +1157,40 @@ class Hal9000Assistant:
         except sqlite3.OperationalError as e:
             logger.warning(f"Failed to record assistant turn in SQLite: {e}")
 
-        # 5. Synthesize and speak response (using sentence streaming pipelining)
+        # 5. Synthesize and speak response (using sentence streaming pipelining or ordered speech queue)
         self.ui.set_state("RESPONDING")
-        self.audio_ctrl.notify_playback_started()
 
         t_tts_start = time.perf_counter()
         tts_first_audio_ms = 0.0
         first_audio_recorded = False
 
-        def _play_chunk(pcm_chunk: bytes):
-            nonlocal tts_first_audio_ms, first_audio_recorded
-            if not first_audio_recorded:
-                tts_first_audio_ms = (time.perf_counter() - t_tts_start) * 1000.0
-                first_audio_recorded = True
-            if not self._cancel_current and not self.is_sleeping:
-                self.playback.play_pcm(pcm_chunk)
-
-        try:
-            if hasattr(self.tts, "speak_sentences"):
-                await self.tts.speak_sentences(hal_reply, on_audio_chunk=_play_chunk)
-            else:
-                loop = asyncio.get_running_loop()
-                raw_pcm_22k = await loop.run_in_executor(None, self.tts.synthesize_raw_pcm, hal_reply)
-                tts_first_audio_ms = (time.perf_counter() - t_tts_start) * 1000.0
+        if self.combine_mode:
+            # Route through OrderedSpeechQueue: buffers remote speech while local playback finishes, never overlaps
+            try:
+                await self.speech_queue.speak_substantive_remote(hal_reply)
+            except Exception as se:
+                logger.debug(f"Combined speech queue delivery error: {se}")
+        else:
+            self.audio_ctrl.notify_playback_started()
+            def _play_chunk(pcm_chunk: bytes):
+                nonlocal tts_first_audio_ms, first_audio_recorded
+                if not first_audio_recorded:
+                    tts_first_audio_ms = (time.perf_counter() - t_tts_start) * 1000.0
+                    first_audio_recorded = True
                 if not self._cancel_current and not self.is_sleeping:
-                    await loop.run_in_executor(None, self.playback.play_pcm, raw_pcm_22k)
-        finally:
-            self.audio_ctrl.notify_playback_stopped()
+                    self.playback.play_pcm(pcm_chunk)
+
+            try:
+                if hasattr(self.tts, "speak_sentences"):
+                    await self.tts.speak_sentences(hal_reply, on_audio_chunk=_play_chunk)
+                else:
+                    loop = asyncio.get_running_loop()
+                    raw_pcm_22k = await loop.run_in_executor(None, self.tts.synthesize_raw_pcm, hal_reply)
+                    tts_first_audio_ms = (time.perf_counter() - t_tts_start) * 1000.0
+                    if not self._cancel_current and not self.is_sleeping:
+                        await loop.run_in_executor(None, self.playback.play_pcm, raw_pcm_22k)
+            finally:
+                self.audio_ctrl.notify_playback_stopped()
 
         tts_total_ms = (time.perf_counter() - t_tts_start) * 1000.0
 

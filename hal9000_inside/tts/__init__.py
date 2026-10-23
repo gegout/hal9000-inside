@@ -1,3 +1,4 @@
+from .speech_queue import OrderedSpeechQueue
 from .hal_piper import (
     HalPiperTTS,
     split_sentences,
@@ -10,6 +11,7 @@ from .hal_piper import (
 )
 
 __all__ = [
+    "OrderedSpeechQueue",
     "HalPiperTTS",
     "split_sentences",
     "MODEL_PATH",

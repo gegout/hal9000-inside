@@ -506,7 +506,7 @@ class TestRemoteFallback(unittest.TestCase):
             )
         local_client.generate_response = mock_local_gen
         local_client.is_configured = True
-        local_client.model = "gemma4-e4b-ov"
+        local_client.model = "smollm2-135m"
 
         router = LLMRouter(remote_client=remote_client, local_client=local_client, force_local=True)
 
