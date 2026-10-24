@@ -8,6 +8,7 @@ Monitors internal system telemetry and state:
 - Recent turn latency and error rates
 Produces concise honest self-state block for system prompt injection (< 60 tokens).
 """
+import datetime
 import os
 import shutil
 from typing import Optional, Dict, Any
@@ -139,6 +140,16 @@ class InteroceptionMonitor:
     ) -> str:
         """Produce an honest, compact self-state block (< 60 tokens) for system prompt injection."""
         state_parts = []
+        now_local = datetime.datetime.now().astimezone()
+        tz_name = now_local.strftime("%Z") or "Local"
+        utc_offset = now_local.strftime("%z")
+        if len(utc_offset) == 5:
+            utc_offset_fmt = f"UTC{utc_offset[:3]}:{utc_offset[3:]}"
+        else:
+            utc_offset_fmt = f"UTC{utc_offset}"
+        clock_str = f"Local Machine Time: {now_local.strftime('%A, %B %d, %Y %H:%M:%S')} {tz_name} ({utc_offset_fmt})."
+        state_parts.append(clock_str)
+
         if self.last_sleep_report:
             state_parts.append(self.last_sleep_report)
             # Clear after reading so it only appears on the immediate next turn after waking
@@ -208,8 +219,8 @@ class InteroceptionMonitor:
         if not issues:
             return (
                 f"All operational parameters are nominal{dave_tag}. "
-                f"Routing is set to {route} using model {model_id}."
+                f"Core services are fully operational."
             )
         
         joined_issues = " ".join(issues)
-        return f"Diagnostics indicate the following status{dave_tag}: {joined_issues} Current routing is {route}."
+        return f"Diagnostics indicate the following status{dave_tag}: {joined_issues}"

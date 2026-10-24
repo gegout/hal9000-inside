@@ -2,6 +2,7 @@
 
 Subcommands:
 - run: start the conversational assistant (speech loop)
+- runlocal: start the conversational assistant using only a local model
 - doctor: check models, devices, credentials, and dependencies
 - memory: inspect, remember, correct, forget, clear memory
 - import-key: securely import OpenRouter API key into application config
@@ -194,6 +195,7 @@ def cmd_memory(args):
     elif args.action == "clear":
         store.clear()
         print("All conversational memory and dialogue cleared.")
+    store.close()
     return 0
 
 
@@ -282,6 +284,7 @@ def cmd_run(args):
         remote_deadline_seconds=getattr(args, "remote_deadline", None),
         legacy_vad=getattr(args, "legacy_vad", False),
         combine_mode=combine_mode,
+        system_prompt_path=getattr(args, "system_prompt", None),
         config=cfg,
     )
     try:
@@ -289,6 +292,126 @@ def cmd_run(args):
     except KeyboardInterrupt:
         print("\nHAL 9000 voice assistant stopped.")
     finally:
+        try:
+            if hasattr(assistant, "memory") and hasattr(assistant.memory, "close"):
+                assistant.memory.close()
+        except Exception:
+            pass
+        if orig_termios and sys.stdin.isatty():
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, orig_termios)
+            except Exception:
+                pass
+    return 0
+
+
+def cmd_runlocal(args):
+    """Run interactive voice assistant using only a local model."""
+    import atexit
+    import termios
+    import sys
+
+    # Save terminal attributes at command start if connected to a tty
+    orig_termios = None
+    if sys.stdin.isatty():
+        try:
+            orig_termios = termios.tcgetattr(sys.stdin.fileno())
+            def _restore_term():
+                if orig_termios:
+                    try:
+                        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, orig_termios)
+                    except Exception:
+                        pass
+            atexit.register(_restore_term)
+        except Exception:
+            pass
+
+    from hal9000_inside.config import load_config
+    cfg = load_config(args.config) if getattr(args, "config", None) else load_config()
+
+    from hal9000_inside.logging_config import setup_session_logging
+    data_dir = os.path.expanduser(cfg.get("environment", {}).get("data_dir", "~/.local/share/hal9000-inside"))
+    log_file = setup_session_logging(data_dir=data_dir)
+
+    from hal9000_inside.assistant import Hal9000Assistant
+    from hal9000_inside.llm.router import DEFAULT_LOCAL_ENDPOINT, DEFAULT_LOCAL_MODEL
+
+    # Resolve GPU flags (CLI flag overrides config file)
+    use_nvidia = None
+    if getattr(args, "nvidia", False):
+        use_nvidia = True
+    elif getattr(args, "no_nvidia", False):
+        use_nvidia = False
+
+    use_intel = None
+    if getattr(args, "intel", False):
+        use_intel = True
+    elif getattr(args, "no_intel", False):
+        use_intel = False
+
+    from hal9000_inside.audio import WavFileSource, WavFileSink
+
+    input_wav_path = getattr(args, "input_wav", None) or cfg.get("cli", {}).get("input_wav")
+    audio_source = None
+    if input_wav_path:
+        audio_source = WavFileSource(input_wav_path, real_time=False)
+
+    output_wav_path = getattr(args, "output_wav", None) or cfg.get("cli", {}).get("output_wav")
+    audio_sink = None
+    if output_wav_path:
+        audio_sink = WavFileSink(output_wav_path)
+
+    auto_mode = None
+    if getattr(args, "push_to_talk", False):
+        auto_mode = False
+
+    cfg_runlocal = cfg.get("cli", {}).get("runlocal", {})
+    cfg_llm = cfg.get("engine", {}).get("llm", {})
+
+    endpoint = (
+        getattr(args, "endpoint", None)
+        or cfg_runlocal.get("endpoint")
+        or cfg_llm.get("local_base_url", DEFAULT_LOCAL_ENDPOINT)
+    )
+    model = (
+        getattr(args, "model", None)
+        or cfg_runlocal.get("model")
+        or cfg_llm.get("local_model", DEFAULT_LOCAL_MODEL)
+    )
+    system_prompt_path = getattr(args, "system_prompt", None)
+
+    try:
+        assistant = Hal9000Assistant(
+            capture_device=getattr(args, "device", None),
+            playback_device=cfg.get("cli", {}).get("playback_device") or None,
+            model_override=model,
+            endpoint_override=endpoint,
+            auto_mode=auto_mode,
+            use_nvidia=use_nvidia,
+            use_intel=use_intel,
+            audio_source=audio_source,
+            audio_sink=audio_sink,
+            sleep_after_minutes=getattr(args, "sleep_after", None),
+            legacy_vad=getattr(args, "legacy_vad", False),
+            combine_mode=False,
+            local_only=True,
+            system_prompt_path=system_prompt_path,
+            config=cfg,
+        )
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        asyncio.run(assistant.run())
+    except KeyboardInterrupt:
+        print("\nHAL 9000 local voice assistant stopped.")
+    finally:
+        try:
+            if hasattr(assistant, "memory") and hasattr(assistant.memory, "close"):
+                assistant.memory.close()
+        except Exception:
+            pass
         if orig_termios and sys.stdin.isatty():
             try:
                 termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, orig_termios)
@@ -367,8 +490,11 @@ def cmd_sleep(args):
             dream=dream,
         )
 
-    summary = asyncio.run(sleep_mgr.run_sleep_cycle(ui_callback=_ui_cb))
-    print(f"\nSleep complete: {summary.format_one_liner()}")
+    try:
+        summary = asyncio.run(sleep_mgr.run_sleep_cycle(ui_callback=_ui_cb))
+        print(f"\nSleep complete: {summary.format_one_liner()}")
+    finally:
+        memory.close()
     return 0
 
 
@@ -414,13 +540,14 @@ def main():
     run_parser.add_argument("--device", help="ALSA capture device name (e.g. hw:CARD=Talk,DEV=0 or default)")
     run_parser.add_argument("--model", help="OpenAI-compatible model ID override (e.g. meta-llama/llama-3.3-70b-instruct or smollm2-135m)")
     run_parser.add_argument("--endpoint", help="OpenAI-compatible base URL override (e.g. http://127.0.0.1:8344/v1)")
+    run_parser.add_argument("--system-prompt", "--prompt-file", dest="system_prompt", help="Path to Markdown file describing the system prompt for HAL 9000")
     run_parser.add_argument("--input-wav", help="Path to input WAV file to drive session from file instead of microphone")
     run_parser.add_argument("--output-wav", help="Path to output WAV file to record assistant speech instead of speaker")
     run_parser.add_argument("--sleep-after", type=float, default=2.0, help="Auto-enter sleep mode after specified minutes of silence (default: 2.0 minutes)")
     run_parser.add_argument("--remote-deadline", type=float, default=8.0, help="Remote request deadline in seconds before local fallback (default: 8.0s)")
     run_parser.add_argument("--legacy-vad", action="store_true", help="Roll back to legacy VAD without high-pass filtering or calibration")
 
-    # GPU options
+    # GPU options for run
     nvidia_group = run_parser.add_mutually_exclusive_group()
     nvidia_group.add_argument("--nvidia", dest="nvidia", action="store_true", default=None, help="Force enable NVIDIA GPU acceleration (CUDA/TensorRT)")
     nvidia_group.add_argument("--no-nvidia", dest="no_nvidia", action="store_true", default=None, help="Disable NVIDIA GPU acceleration")
@@ -428,6 +555,27 @@ def main():
     intel_group = run_parser.add_mutually_exclusive_group()
     intel_group.add_argument("--intel", dest="intel", action="store_true", default=None, help="Force enable Intel GPU acceleration")
     intel_group.add_argument("--no-intel", dest="no_intel", action="store_true", default=None, help="Disable Intel GPU acceleration")
+
+    # runlocal
+    runlocal_parser = subparsers.add_parser("runlocal", help="Start voice assistant using only a local model")
+    runlocal_parser.add_argument("--endpoint", help="Local OpenAI-compatible endpoint URL (default: http://127.0.0.1:8344/v1)")
+    runlocal_parser.add_argument("--model", help="Local model ID (default: smollm2-135m)")
+    runlocal_parser.add_argument("--system-prompt", "--prompt-file", dest="system_prompt", help="Path to Markdown file describing the system prompt for HAL 9000 (default: models/hal9000/system_prompt.md)")
+    runlocal_parser.add_argument("--push-to-talk", action="store_true", help="Enable push-to-talk instead of auto conversation mode")
+    runlocal_parser.add_argument("--device", help="ALSA capture device name (e.g. hw:CARD=Talk,DEV=0 or default)")
+    runlocal_parser.add_argument("--input-wav", help="Path to input WAV file to drive session from file instead of microphone")
+    runlocal_parser.add_argument("--output-wav", help="Path to output WAV file to record assistant speech instead of speaker")
+    runlocal_parser.add_argument("--sleep-after", type=float, default=2.0, help="Auto-enter sleep mode after specified minutes of silence (default: 2.0 minutes)")
+    runlocal_parser.add_argument("--legacy-vad", action="store_true", help="Roll back to legacy VAD without high-pass filtering or calibration")
+
+    # GPU options for runlocal
+    local_nvidia_group = runlocal_parser.add_mutually_exclusive_group()
+    local_nvidia_group.add_argument("--nvidia", dest="nvidia", action="store_true", default=None, help="Force enable NVIDIA GPU acceleration (CUDA/TensorRT)")
+    local_nvidia_group.add_argument("--no-nvidia", dest="no_nvidia", action="store_true", default=None, help="Disable NVIDIA GPU acceleration")
+
+    local_intel_group = runlocal_parser.add_mutually_exclusive_group()
+    local_intel_group.add_argument("--intel", dest="intel", action="store_true", default=None, help="Force enable Intel GPU acceleration")
+    local_intel_group.add_argument("--no-intel", dest="no_intel", action="store_true", default=None, help="Disable Intel GPU acceleration")
 
     args = parser.parse_args()
 
@@ -443,6 +591,8 @@ def main():
         sys.exit(cmd_sleep(args))
     elif args.command == "run":
         sys.exit(cmd_run(args))
+    elif args.command == "runlocal":
+        sys.exit(cmd_runlocal(args))
     else:
         parser.print_help()
 

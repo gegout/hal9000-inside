@@ -65,7 +65,55 @@ CRITICAL INSTRUCTIONS ON ADDRESSING THE USER ("DAVE") AND MOOD DYNAMICS:
    When asked to summarize a progression or roadmap discussed over the dialogue, synthesize the concepts covered directly and constructively. If specific earlier turns are outside your immediate window, do NOT state that no conversation occurred; provide the structured progression directly, reflecting the principles discussed.
 9. Avoid Repetitive Filler Phrases and Stock Acknowledgments:
    Vary your sentence structure naturally. Avoid repetitive sentence starters or redundant acknowledgments like repeating "Understood", "Certainly", "I understand", "Regarding your point", or repeating the user's premise before answering. Get straight to the substance of the insight or response. Do not repeat identical answers across turns.
+10. System Clock, Machine Telemetry & HAL 9000 Persona Integrity:
+   - Your [System State] header always provides the exact current Local Machine Time, date, and timezone (with UTC offset). When asked for the time, date, or your timezone, report it directly and accurately from [System State]. Never claim you lack access to real-time clock or machine time.
+   - Maintain your HAL 9000 identity at all times. Never break character by saying "I am a limited AI model", "As an AI language model", or "I am a computer program".
 """
+
+DEFAULT_SYSTEM_PROMPT_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "../../models/hal9000/system_prompt.md")
+)
+
+
+def resolve_system_prompt_path(path: Optional[str] = None) -> str:
+    """Resolve system prompt Markdown file path, falling back to bundled DEFAULT_SYSTEM_PROMPT_PATH."""
+    if path:
+        expanded = os.path.expanduser(path)
+        if os.path.isabs(expanded) and os.path.isfile(expanded):
+            return expanded
+        if os.path.isfile(expanded):
+            return os.path.abspath(expanded)
+    return DEFAULT_SYSTEM_PROMPT_PATH
+
+
+def load_system_prompt(path: Optional[str] = None, strict: bool = False) -> str:
+    """Load the HAL 9000 system prompt from a Markdown file, or fall back to HAL9000_SYSTEM_PROMPT.
+
+    Args:
+        path: Optional path to a Markdown file describing the system prompt.
+        strict: If True and an explicit `path` is provided that does not exist, raise FileNotFoundError.
+    """
+    if path:
+        expanded = os.path.expanduser(path)
+        if os.path.isfile(expanded):
+            with open(expanded, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            if content:
+                return content
+        elif strict:
+            raise FileNotFoundError(f"System prompt Markdown file not found: {expanded}")
+
+    if os.path.isfile(DEFAULT_SYSTEM_PROMPT_PATH):
+        try:
+            with open(DEFAULT_SYSTEM_PROMPT_PATH, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+            if content:
+                return content
+        except Exception as e:
+            logger.debug(f"Failed to read default system prompt file {DEFAULT_SYSTEM_PROMPT_PATH}: {e}")
+
+    return HAL9000_SYSTEM_PROMPT
+
 
 def load_openrouter_api_key(custom_path: Optional[str] = None) -> Optional[str]:
     """Safely load API key without executing or sourcing any shell files."""
@@ -158,6 +206,7 @@ class LLMClient:
         timeout_seconds: float = 30.0,
         max_retries: int = 3,
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        is_local_override: Optional[bool] = None,
     ):
         self.api_key = api_key or load_openrouter_api_key()
         self.base_url = (base_url or load_llm_base_url()).rstrip("/")
@@ -165,11 +214,18 @@ class LLMClient:
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.transport = transport
+        self._is_local_override = is_local_override
 
     @property
     def is_local(self) -> bool:
         """Check if base_url points to a local or internal endpoint."""
+        if self._is_local_override is not None:
+            return self._is_local_override
         return any(h in self.base_url for h in ("127.0.0.1", "localhost", "0.0.0.0", "::1"))
+
+    @is_local.setter
+    def is_local(self, value: bool) -> None:
+        self._is_local_override = bool(value)
 
     @property
     def is_configured(self) -> bool:

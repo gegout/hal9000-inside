@@ -262,10 +262,12 @@ class LLMRouter:
                                 pass
                         # If remote client is configured and was not an auth error, give remote one direct attempt
                         if self.remote_client and not is_auth_error:
+                            t0_rem = time.perf_counter()
                             try:
                                 res = await self.remote_client.generate_response(
                                     messages, tools=tools, return_dict=return_dict, max_tokens=max_tokens
                                 )
+                                self.record_remote_result((time.perf_counter() - t0_rem) * 1000.0, error=False, unreachable=False)
                                 return res, "remote", self.remote_client.model
                             except Exception:
                                 pass
@@ -277,9 +279,11 @@ class LLMRouter:
                             pass
                     return res, "local", self.local_client.model
                 elif self.remote_client:
+                    t0_rem = time.perf_counter()
                     res = await self.remote_client.generate_response(
                         messages, tools=tools, return_dict=return_dict, max_tokens=max_tokens
                     )
+                    self.record_remote_result((time.perf_counter() - t0_rem) * 1000.0, error=False, unreachable=False)
                     if cb_task:
                         try:
                             await cb_task
@@ -299,19 +303,25 @@ class LLMRouter:
                 self.local_backoff_until = time.time() + 60.0
                 logger.warning(f"Local LLM execution failed ({le}). Trying remote backup if available.")
                 if self.remote_client and self.remote_client.is_configured:
+                    t0 = time.perf_counter()
                     try:
                         res = await self.remote_client.generate_response(
                             messages, tools=tools, return_dict=return_dict, max_tokens=max_tokens
                         )
+                        latency_ms = (time.perf_counter() - t0) * 1000.0
+                        self.record_remote_result(latency_ms, error=False, unreachable=False)
                         return res, "remote", self.remote_client.model
                     except Exception as re:
                         self.last_remote_error = re
                         raise
                 raise
         elif self.remote_client:
+            t0 = time.perf_counter()
             res = await self.remote_client.generate_response(
                 messages, tools=tools, return_dict=return_dict, max_tokens=max_tokens
             )
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+            self.record_remote_result(latency_ms, error=False, unreachable=False)
             return res, "remote", self.remote_client.model
 
         raise RuntimeError("No LLM client configured for generation.")

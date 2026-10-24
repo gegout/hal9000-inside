@@ -1,6 +1,6 @@
 name: hal9000-inside
 base: core24
-version: '0.4.2'
+version: '0.4.8'
 summary: HAL 9000 voice assistant for Ubuntu
 description: |
   HAL 9000 Inside is a complete Ubuntu voice assistant running local STT

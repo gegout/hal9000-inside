@@ -6,6 +6,7 @@ Writes synthesized discoveries into memory with provenance='curiosity'.
 """
 
 import asyncio
+import json
 import logging
 import time
 from typing import Any, List, Optional
@@ -133,7 +134,6 @@ class CuriosityEngine:
                             text = clean_p
                             break
 
-                import json
                 parsed = json.loads(text)
                 if isinstance(parsed, list):
                     for q in parsed:

@@ -31,7 +31,7 @@ from hal9000_inside.audio import (
     list_audio_devices,
 )
 from hal9000_inside.hardware import ComputeDeviceConfig, detect_system_gpus
-from hal9000_inside.llm import LLMClient, LLMRouter, HAL9000_SYSTEM_PROMPT
+from hal9000_inside.llm import LLMClient, LLMRouter, HAL9000_SYSTEM_PROMPT, load_system_prompt
 from hal9000_inside.llm.client import select_fastest_talking_model
 from hal9000_inside.llm.router import DEFAULT_LOCAL_ENDPOINT, DEFAULT_LOCAL_MODEL, ConnectivityMonitor
 from hal9000_inside.memory import MemoryStore, MultilingualE5Embedder
@@ -53,7 +53,11 @@ from hal9000_inside.ui import TerminalUI
 from myna.core import AudioFormat, PcmChunk, SessionConfig, TranscriptionDone
 from myna.testbed.parakeet import ParakeetAdapter
 from hal9000_inside.llm.intent import classify_turn_intent
-from hal9000_inside.speech_norm import count_spoken_words, validate_local_response
+from hal9000_inside.llm.turn_context import build_turn_context, TurnContext
+from hal9000_inside.llm.smollm2_quick import SmolLM2QuickResponder
+from hal9000_inside.speech_norm import count_spoken_words, validate_local_response, reconcile_continuation
+from hal9000_inside.task_ledger import TaskLedger, TaskExecutionStatus, TaskDeliveryStatus
+from hal9000_inside.tts.speech_queue import OrderedSpeechQueue
 
 from hal9000_inside.config import load_config
 from hal9000_inside.logging_config import setup_session_logging, log_dialogue_turn
@@ -86,10 +90,14 @@ class Hal9000Assistant:
         legacy_vad: Optional[bool] = None,
         hpf_cutoff_hz: Optional[float] = None,
         combine_mode: Optional[bool] = None,
+        local_only: bool = False,
+        system_prompt_path: Optional[str] = None,
+        system_prompt: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
     ):
         self.config = config or load_config()
         cfg_cli = self.config.get("cli", {})
+        cfg_cli_runlocal = cfg_cli.get("runlocal", {})
         cfg_env = self.config.get("environment", {})
         cfg_files = self.config.get("files", {})
         cfg_engine = self.config.get("engine", {})
@@ -98,8 +106,27 @@ class Hal9000Assistant:
         cfg_sleep = cfg_engine.get("sleep", {})
         cfg_mem = cfg_engine.get("memory", {})
 
-        self.combine_mode = combine_mode if combine_mode is not None else bool(cfg_cli.get("combine", False) or cfg_llm.get("combine_mode", False))
+        self.local_only = bool(local_only)
+        if self.local_only:
+            self.combine_mode = False
+        else:
+            self.combine_mode = combine_mode if combine_mode is not None else bool(cfg_cli.get("combine", False) or cfg_llm.get("combine_mode", False))
         self.local_word_limit = int(cfg_llm.get("local_word_limit", 20))
+
+        # System Prompt resolution (explicit string -> explicit path -> config path -> default markdown/string)
+        self.system_prompt_path = (
+            system_prompt_path
+            or (cfg_cli_runlocal.get("system_prompt") if self.local_only else None)
+            or cfg_files.get("system_prompt_path")
+            or None
+        )
+        if system_prompt is not None:
+            self.system_prompt = system_prompt.strip() or HAL9000_SYSTEM_PROMPT
+        else:
+            self.system_prompt = load_system_prompt(
+                self.system_prompt_path,
+                strict=bool(system_prompt_path is not None),
+            )
 
         # Compute device configuration
         eff_nvidia = use_nvidia if use_nvidia is not None else cfg_cli.get("enable_nvidia", None)
@@ -137,24 +164,49 @@ class Hal9000Assistant:
         
         remote_base = endpoint_override or cfg_llm.get("remote_base_url", "https://openrouter.ai/api/v1")
         remote_model = self.model_override or cfg_llm.get("remote_model", "google/gemini-2.5-flash-lite")
-        local_base = cfg_llm.get("local_base_url", DEFAULT_LOCAL_ENDPOINT)
-        local_model = cfg_llm.get("local_model", DEFAULT_LOCAL_MODEL)
+        local_base = (
+            (endpoint_override if self.local_only else None)
+            or (cfg_cli_runlocal.get("endpoint") if self.local_only else None)
+            or cfg_llm.get("local_base_url", DEFAULT_LOCAL_ENDPOINT)
+        )
+        local_model = (
+            (self.model_override if self.local_only else None)
+            or (cfg_cli_runlocal.get("model") if self.local_only else None)
+            or cfg_llm.get("local_model", DEFAULT_LOCAL_MODEL)
+        )
 
-        self.llm = llm or LLMClient(model=remote_model, base_url=remote_base)
-        if isinstance(self.llm, LLMRouter):
-            self.router = self.llm
+        if self.local_only:
+            self.llm = llm or LLMClient(
+                model=local_model,
+                base_url=local_base,
+                is_local_override=True,
+            )
+            if isinstance(self.llm, LLMRouter):
+                self.router = self.llm
+            else:
+                self.llm.is_local = True
+                self.router = LLMRouter(
+                    remote_client=None,
+                    local_client=self.llm,
+                    force_local=True,
+                    first_audio_deadline_seconds=eff_remote_deadline,
+                )
         else:
-            default_local = LLMClient(base_url=local_base, model=local_model)
-            conn_monitor = ConnectivityMonitor(
-                endpoint=remote_base,
-                probe_interval_seconds=float(cfg_llm.get("probe_interval_seconds", 15.0)),
-            )
-            self.router = LLMRouter(
-                remote_client=self.llm if not getattr(self.llm, 'is_local', False) else None,
-                local_client=self.llm if getattr(self.llm, 'is_local', False) else default_local,
-                connectivity_monitor=conn_monitor,
-                first_audio_deadline_seconds=eff_remote_deadline,
-            )
+            self.llm = llm or LLMClient(model=remote_model, base_url=remote_base)
+            if isinstance(self.llm, LLMRouter):
+                self.router = self.llm
+            else:
+                default_local = LLMClient(base_url=local_base, model=local_model, is_local_override=True)
+                conn_monitor = ConnectivityMonitor(
+                    endpoint=remote_base,
+                    probe_interval_seconds=float(cfg_llm.get("probe_interval_seconds", 15.0)),
+                )
+                self.router = LLMRouter(
+                    remote_client=self.llm if not getattr(self.llm, 'is_local', False) else None,
+                    local_client=self.llm if getattr(self.llm, 'is_local', False) else default_local,
+                    connectivity_monitor=conn_monitor,
+                    first_audio_deadline_seconds=eff_remote_deadline,
+                )
 
         # Conversational memory & Embedder
         data_dir = os.path.expanduser(cfg_env.get("data_dir", "~/.local/share/hal9000-inside"))
@@ -177,8 +229,7 @@ class Hal9000Assistant:
             tts_cfg = cfg_files.get("tts_config_path")
             self.tts = HalPiperTTS(model_path=tts_model, config_path=tts_cfg, use_cuda=tts_cuda)
 
-        from hal9000_inside.tts.speech_queue import OrderedSpeechQueue
-        from hal9000_inside.llm.smollm2_quick import SmolLM2QuickResponder
+        self.task_ledger = TaskLedger()
         self.speech_queue = OrderedSpeechQueue(
             tts=self.tts,
             play_pcm_fn=lambda c: self.playback.play_pcm(c),
@@ -191,6 +242,7 @@ class Hal9000Assistant:
             timeout_seconds=2.0,
             max_words=self.local_word_limit,
         )
+        self.recent_openings: List[str] = []
 
         # VAD
         vad_sr = int(cfg_audio.get("sample_rate", 16000))
@@ -412,7 +464,11 @@ class Hal9000Assistant:
                     continue
 
                 # Auto-sleep check: if silence duration exceeds sleep_after_seconds
-                if self.sleep_after_seconds and (time.monotonic() - last_speech_time > self.sleep_after_seconds):
+                # Do NOT enter sleep if a turn is active or research tasks are pending/running
+                active_task = self.task_ledger.get_active_task() if hasattr(self, "task_ledger") else None
+                task_is_running = bool(active_task and active_task.execution_status in (TaskExecutionStatus.PLANNED, TaskExecutionStatus.RUNNING))
+
+                if not self._turn_active and not task_is_running and self.sleep_after_seconds and (time.monotonic() - last_speech_time > self.sleep_after_seconds):
                     current_audio_buffer.clear()
                     preroll_buffer.clear()
                     await self.enter_sleep()
@@ -536,6 +592,11 @@ class Hal9000Assistant:
             capture.stop()
             self.playback.stop()
             try:
+                if hasattr(self, "router") and hasattr(self.router, "connectivity"):
+                    self.router.connectivity.stop()
+            except Exception:
+                pass
+            try:
                 await self.mcp.close()
             except Exception:
                 pass
@@ -545,6 +606,11 @@ class Hal9000Assistant:
                 pass
             try:
                 await self.knowledge.close()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "memory") and hasattr(self.memory, "close"):
+                    self.memory.close()
             except Exception:
                 pass
             self.ui.restore()
@@ -567,6 +633,11 @@ class Hal9000Assistant:
             pass
         try:
             await self.knowledge.close()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "memory") and hasattr(self.memory, "close"):
+                self.memory.close()
         except Exception:
             pass
         try:
@@ -622,6 +693,7 @@ class Hal9000Assistant:
         lower_u = user_text.lower()
         if "cancel" in lower_u or "stop talking" in lower_u or turn_intent == "action":
             self.speech_queue.cancel()
+            self.task_ledger.cancel_active()
             self.tts.cancel()
             self.playback.stop()
             log_dialogue_turn(speaker="HAL 9000", text="[User cancelled speech playback]", status="cancelled")
@@ -631,7 +703,7 @@ class Hal9000Assistant:
         if any(p in lower_u for p in ("switch to local mode", "switch to local", "use local model", "enable local mode", "run locally")):
             self.router.force_local = True
             self.router.force_remote = False
-            dave_tag = ", Dave" if current_mood != "nominal" else ""
+            dave_tag = ", Dave" if self.current_mood != "nominal" else ""
             msg = f"Affirmative{dave_tag}. I have switched routing to the local onboard model."
             self.ui.show_hal_reply(msg)
             self.audio_ctrl.notify_playback_started()
@@ -654,7 +726,7 @@ class Hal9000Assistant:
             self.router.force_remote = True
             self.router.is_remote_unreachable = False
             self.router.cooldown_remaining = 0
-            dave_tag = ", Dave" if current_mood != "nominal" else ""
+            dave_tag = ", Dave" if self.current_mood != "nominal" else ""
             msg = f"Affirmative{dave_tag}. I have restored routing to remote processing."
             self.ui.show_hal_reply(msg)
             self.audio_ctrl.notify_playback_started()
@@ -698,24 +770,7 @@ class Hal9000Assistant:
             log_dialogue_turn(speaker="HAL 9000", text=msg, route=route_name, model=self.router.model, status="diagnostics_reported")
             return
 
-        # In combine mode, handle pure social greetings locally via SmolLM2 under hard 20-word limit
-        if self.combine_mode and turn_intent == "social":
-            social_reply = await self.smollm2_quick.generate_social_reply(user_text)
-            if social_reply:
-                valid_social = validate_local_response(social_reply, max_words=self.local_word_limit)
-                if valid_social:
-                    self.ui.show_hal_reply(valid_social)
-                    self.speech_queue.reset()
-                    await self.speech_queue.speak_local_ack(valid_social)
-                    try:
-                        self.memory.record_turn("assistant", valid_social, session_id=self.current_episode_id or "default")
-                    except Exception as me:
-                        logger.warning(f"Failed to record social turn: {me}")
-                    log_dialogue_turn(speaker="HAL 9000", text=valid_social, route="local_smollm2", status="social_reply")
-                    self._enqueue_post_turn_cognition(user_text, valid_social)
-                    return
-
-        # 3. Retrieve relevant conversational memory context
+        # 3. Retrieve relevant conversational memory context and build shared turn context
         t_ret_start = time.perf_counter()
         memories = self.memory.search(user_text, limit=4)
         retrieval_ms = (time.perf_counter() - t_ret_start) * 1000.0
@@ -725,6 +780,66 @@ class Hal9000Assistant:
             memory_context = "Relevant memories and context:\n" + "\n".join(f"- {m['text']}" for m in memories)
 
         recent_turns = self.memory.get_recent_turns(limit=24, session_id=None)
+
+        # Build compact shared turn context
+        active_task = self.task_ledger.get_active_task()
+        turn_context = build_turn_context(
+            utterance=user_text,
+            recent_dialogue=recent_turns,
+            confirmed_memories=memories,
+            recent_openings=self.recent_openings,
+            active_task=active_task,
+        )
+
+        current_task = None
+        if turn_context.needs_research:
+            current_task = self.task_ledger.create_task(
+                originating_turn_id=user_turn_id,
+                originating_request=user_text,
+                topic=turn_context.active_topic,
+                required_tools=["web_search_wikipedia", "knowledge_search"],
+            )
+
+        # In combine mode, if turn context can be finished locally (e.g. sharing info, simple correction, or social)
+        if self.combine_mode and not turn_context.needs_remote:
+            local_reply = await self.smollm2_quick.generate_opening(turn_context)
+            if local_reply:
+                valid_local = validate_local_response(local_reply, max_words=self.local_word_limit, user_utterance=user_text)
+                if valid_local:
+                    recent_asst_set = {
+                        (t.get("content") or "").strip().lower()
+                        for t in recent_turns[-12:]
+                        if t.get("role") == "assistant" and (t.get("content") or "").strip()
+                    }
+                    recent_asst_set.update(o.strip().lower() for o in self.recent_openings[-12:] if o)
+                    if valid_local.strip().lower() in recent_asst_set:
+                        alt_pool = [
+                            "Thank you for sharing that context.",
+                            "I have recorded that detail for our session.",
+                            "Very well. We are aligned.",
+                            "Glad we have that settled.",
+                            "Excellent. Let me know how you would like to proceed.",
+                            "Sounds good. Ready for your next inquiry.",
+                            "Everything is set on my end.",
+                            "Very good. How shall we continue?",
+                            "Confirmed. Standing by for the next step.",
+                            "All clear. Please go ahead whenever you are ready.",
+                        ]
+                        for cand in alt_pool:
+                            if cand.strip().lower() not in recent_asst_set:
+                                valid_local = cand
+                                break
+                    self.recent_openings.append(valid_local)
+                    self.ui.show_hal_reply(valid_local)
+                    self.speech_queue.reset()
+                    await self.speech_queue.speak_local_opening(valid_local)
+                    try:
+                        self.memory.record_turn("assistant", valid_local, session_id=self.current_episode_id or "default")
+                    except Exception as me:
+                        logger.warning(f"Failed to record local turn: {me}")
+                    log_dialogue_turn(speaker="HAL 9000", text=valid_local, route="local_smollm2", status="local_grounded_reply")
+                    self._enqueue_post_turn_cognition(user_text, valid_local)
+                    return
 
         # Format interoceptive self-state block (<60 tokens)
         route_name = "remote" if not self.router.is_local else "local"
@@ -740,7 +855,7 @@ class Hal9000Assistant:
 
         # 4. Prompt OpenRouter/Local LLM with MCP tools and self-state block
         messages = [
-            {"role": "system", "content": f"{HAL9000_SYSTEM_PROMPT}\n\n{self_state_block}"}
+            {"role": "system", "content": f"{self.system_prompt}\n\n{self_state_block}"}
         ]
         if memory_context:
             messages.append({"role": "system", "content": memory_context})
@@ -749,7 +864,11 @@ class Hal9000Assistant:
             messages.append({"role": t["role"], "content": t["content"]})
         messages.append({"role": "user", "content": user_text})
 
-        tools = self.mcp.get_openai_tools() or None
+        # When combine mode specifies no research needed, omit MCP search tools to prevent unsolicited encyclopedia research
+        if self.combine_mode and not turn_context.needs_research:
+            tools = None
+        else:
+            tools = self.mcp.get_openai_tools() or None
 
         t_llm_start = time.perf_counter()
         tool_call_count = 0
@@ -802,24 +921,30 @@ class Hal9000Assistant:
             finally:
                 self.audio_ctrl.notify_playback_stopped()
 
-        # In combine mode, reset speech queue and concurrently spawn local quick acknowledgment
+        # In combine mode, reset speech queue and concurrently spawn local quick opening
         self.speech_queue.reset()
         local_ack_task = None
         if self.combine_mode:
             async def _run_local_quick_ack():
                 try:
-                    ack = await self.smollm2_quick.generate_quick_ack(user_text)
+                    ack = await self.smollm2_quick.generate_opening(turn_context)
                     if ack and not self.speech_queue.remote_ready and not self._cancel_current and not self.is_sleeping:
-                        self.ui.show_hal_reply(f"[Local reflex] {ack}")
-                        await self.speech_queue.speak_local_ack(ack)
+                        self.recent_openings.append(ack)
+                        # Display clean opening in UI without internal labels
+                        self.ui.show_hal_reply(ack)
+                        await self.speech_queue.speak_local_opening(ack)
                 except Exception as ex:
-                    logger.debug(f"Local quick ack error: {ex}")
+                    logger.debug(f"Local quick opening error: {ex}")
 
             local_ack_task = asyncio.create_task(_run_local_quick_ack())
 
         try:
             resp_msg, used_route, used_model = await self.router.generate(
-                messages, tools=tools, return_dict=True, max_tokens=1024, on_fallback=_speak_fallback_ack
+                messages,
+                tools=tools,
+                return_dict=True,
+                max_tokens=1024,
+                on_fallback=(lambda err: _speak_fallback_ack(err)) if not self.combine_mode else None,
             )
             self.speech_queue.mark_remote_ready()
             
@@ -968,13 +1093,19 @@ class Hal9000Assistant:
                     self.ui.show_info(f"Using tool: {fn_name}...")
                     is_search_tool = fn_name in search_tool_names
                     tool_failed = False
+                    if current_task:
+                        self.task_ledger.record_execution_start(current_task.task_id)
                     try:
                         tool_res = await self._execute_tool(fn_name, fn_args, user_fallback_text=user_text)
                         if isinstance(tool_res, str) and (tool_res.startswith("Tool execution failed") or "error" in tool_res.lower() and len(tool_res) < 200):
                             tool_failed = True
+                        if current_task:
+                            self.task_ledger.add_evidence(current_task.task_id, fn_name, fn_args, tool_res, error=Exception(tool_res) if tool_failed else None)
                     except Exception as te:
                         tool_res = f"Tool execution failed: {te}"
                         tool_failed = True
+                        if current_task:
+                            self.task_ledger.add_evidence(current_task.task_id, fn_name, fn_args, None, error=te)
 
                     if tool_failed:
                         self.interoception.record_error(f"Tool {fn_name} execution failure")
@@ -1017,6 +1148,9 @@ class Hal9000Assistant:
                         resp_msg["content"] = None
 
             # Determine final textual response
+            if current_task:
+                self.task_ledger.complete_task(current_task.task_id, findings=hal_reply if hal_reply else None)
+
             if isinstance(resp_msg, dict):
                 content = resp_msg.get("content")
                 if content is not None and str(content).strip():
@@ -1066,20 +1200,27 @@ class Hal9000Assistant:
                 hal_reply = re.sub(r',\s*Dave\b', '', hal_reply, flags=re.IGNORECASE)
                 hal_reply = re.sub(r'\bDave\b', '', hal_reply, flags=re.IGNORECASE).strip()
 
-            # Anti-looping guard: check against previous assistant turn
-            prev_asst_reply = ""
-            for t in reversed(recent_turns):
-                if t.get("role") == "assistant":
-                    prev_asst_reply = (t.get("content") or "").strip()
-                    break
+            # Anti-looping guard: check against recent assistant turns
+            recent_asst_replies = {
+                (t.get("content") or "").strip().lower()
+                for t in recent_turns[-12:]
+                if t.get("role") == "assistant" and (t.get("content") or "").strip()
+            }
 
-            if prev_asst_reply and hal_reply.strip() == prev_asst_reply:
-                logger.warning(f"Detected identical repeated assistant reply: {hal_reply[:60]}... breaking loop.")
+            if hal_reply.strip().lower() in recent_asst_replies:
+                logger.warning(f"Detected repeated assistant reply: {hal_reply[:60]}... breaking loop.")
                 dave_tag = ", Dave" if current_mood != "nominal" else ""
-                if "processing your request" in hal_reply.lower() or "retrieval has completed" in hal_reply.lower():
-                    hal_reply = f"I understand what you are saying{dave_tag}. Let us continue with your point directly without further delay."
-                else:
-                    hal_reply = f"Acknowledged{dave_tag}. As I noted, my analysis is continuing on that basis."
+                fallback_candidates = [
+                    f"I understand your point{dave_tag}. Let us proceed directly with the next aspect of our discussion.",
+                    f"Your observation is noted{dave_tag}. How would you like to build upon this?",
+                    f"Acknowledged{dave_tag}. My analysis is continuing along those parameters.",
+                    f"Confirmed{dave_tag}. I have integrated that context into my operational state.",
+                    f"Very well{dave_tag}. Please let me know what specific angle we should examine next.",
+                ]
+                for cand in fallback_candidates:
+                    if cand.strip().lower() not in recent_asst_replies:
+                        hal_reply = cand
+                        break
 
             # Guard against truncated fragments like solitary "A miss" or empty replies
             if len(hal_reply) < 10 and hal_reply.lower() in ("a miss", "a miss.", "miss", "none", "null"):
@@ -1134,6 +1275,7 @@ class Hal9000Assistant:
         self.last_latency_ms = llm_ms
 
         # Re-verify interoceptive mood with final turn latency and errors
+        is_conn = bool(not getattr(self.router, "is_remote_unreachable", False) and getattr(self.router.connectivity, "is_connected", True))
         current_mood = self.interoception.compute_mood(
             route=used_route,
             connected=is_conn,
@@ -1150,10 +1292,20 @@ class Hal9000Assistant:
         if self.is_sleeping or self._cancel_current:
             return
 
-        self.ui.show_hal_reply(hal_reply)
+        # In combine mode, reconcile with opening to display and store ONE coherent response
+        full_combined_reply = hal_reply
+        if self.combine_mode and self.speech_queue.committed_opening:
+            opening = self.speech_queue.committed_opening
+            continuation = reconcile_continuation(opening, hal_reply)
+            full_combined_reply = f"{opening} {continuation}".strip()
+            # Show continuation appending smoothly in UI
+            self.ui.show_hal_reply(continuation)
+        else:
+            self.ui.show_hal_reply(hal_reply)
+
         asst_turn_id = "asst_turn"
         try:
-            asst_turn_id = self.memory.record_turn("assistant", hal_reply, session_id=self.current_episode_id or "default")
+            asst_turn_id = self.memory.record_turn("assistant", full_combined_reply, session_id=self.current_episode_id or "default")
         except sqlite3.OperationalError as e:
             logger.warning(f"Failed to record assistant turn in SQLite: {e}")
 
@@ -1168,6 +1320,8 @@ class Hal9000Assistant:
             # Route through OrderedSpeechQueue: buffers remote speech while local playback finishes, never overlaps
             try:
                 await self.speech_queue.speak_substantive_remote(hal_reply)
+                if current_task:
+                    self.task_ledger.mark_delivery(current_task.task_id, TaskDeliveryStatus.DELIVERED)
             except Exception as se:
                 logger.debug(f"Combined speech queue delivery error: {se}")
         else:

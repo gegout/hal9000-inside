@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hal9000-inside"
-version = "0.4.2"
+version = "0.4.8"
 description = "HAL 9000 Inside - Ubuntu Voice Assistant"
 readme = "README.md"
 license = {text = "AGPL-3.0"}
@@ -33,6 +33,7 @@ include = ["hal9000_inside*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = [".", "hal9000_inside/stt"]
 norecursedirs = [
     "snap_root",
     ".venv",

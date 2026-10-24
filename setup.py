@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="hal9000-inside",
-    version="0.2.0",
+    version="0.4.8",
     description="HAL 9000 Inside - Ubuntu Voice Assistant",
     license="AGPL-3.0",
     author="cgegout",

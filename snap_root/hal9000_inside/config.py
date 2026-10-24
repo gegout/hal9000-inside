@@ -44,6 +44,11 @@ enable_intel = true               # Force enable/disable Intel GPU acceleration 
 [cli.sleep]
 duration_minutes = 10.0           # Default duration for standalone headless sleep command (`hal9000-inside sleep`)
 
+[cli.runlocal]
+endpoint = "http://127.0.0.1:8344/v1" # Local OpenAI-compatible endpoint URL
+model = "smollm2-135m"                # Local model ID
+system_prompt = "models/hal9000/system_prompt.md" # Markdown file describing the system prompt for HAL 9000
+
 # ------------------------------------------------------------------------------
 # Layer 2: Environment & System Paths
 # ------------------------------------------------------------------------------
@@ -69,6 +74,9 @@ node_path = ""                    # NODE_PATH for global node modules ("" for au
 [files]
 # LLM credentials configuration file
 openrouter_config_path = "~/.openrouter.config"
+
+# Markdown file describing the system prompt for HAL 9000
+system_prompt_path = "models/hal9000/system_prompt.md"
 
 # Voice model files (Piper TTS)
 tts_model_path = "models/hal9000/hal.onnx"
