@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hal9000-inside"
-version = "0.4.9"
+version = "0.4.10"
 description = "HAL 9000 Inside - Ubuntu Voice Assistant"
 readme = "README.md"
 license = {text = "AGPL-3.0"}

@@ -362,9 +362,10 @@ class SmolLM2QuickResponder:
         payload = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": 30,
+            "max_tokens": 35,
             "temperature": 0.2,
-            "stop": ["\n", "User:", "HAL:", "Dave:"],
+            "stop": ["\nUser:", "\nUSER:", "\nHAL:", "\nDave:", "<|im_end|>"],
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
         try:
@@ -377,6 +378,9 @@ class SmolLM2QuickResponder:
                         .get("message", {})
                         .get("content", "")
                     )
+                    if content:
+                        content = re.sub(r"<think>.*?</think>", "", str(content), flags=re.DOTALL).strip()
+                        content = content.splitlines()[0].strip() if content else ""
                     # Validate against 20-word limit, instruction leakage, echoing, and invented identity
                     fallback = self.get_safe_bridge_fallback(turn_context) or ""
                     valid = validate_local_response(

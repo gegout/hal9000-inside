@@ -179,6 +179,29 @@ class Hal9000Assistant:
             or cfg_llm.get("local_model", DEFAULT_LOCAL_MODEL)
         )
 
+        # Auto-discover active local endpoint & served model ID when using default/local ports
+        # (e.g. if user switched from smollm2 on 8344 to smollm3 on 8366)
+        if llm is None and (self.local_only or self.combine_mode):
+            try:
+                from hal9000_inside.smollm2 import sync_discover_local_llm_endpoint
+                allow_alt_ports = not bool(endpoint_override)
+                disc_ep, disc_mod, disc_ok = sync_discover_local_llm_endpoint(
+                    preferred_endpoint=local_base,
+                    preferred_model=local_model,
+                    timeout_seconds=1.2,
+                    allow_fallback_ports=allow_alt_ports,
+                )
+                if disc_ok:
+                    if disc_ep != local_base.rstrip("/") or disc_mod != local_model:
+                        logger.info(
+                            f"Resolved active local LLM endpoint: {disc_ep} (model: {disc_mod})"
+                        )
+                    local_base = disc_ep
+                    if not self.model_override:
+                        local_model = disc_mod
+            except Exception as de:
+                logger.debug(f"Local LLM auto-discovery skipped: {de}")
+
         if self.local_only:
             self.llm = llm or LLMClient(
                 model=local_model,
@@ -843,7 +866,26 @@ class Hal9000Assistant:
                 memory_context = "Relevant memories and context:\n" + "\n".join(f"- {m['text']}" for m in memories)
 
         history_limit = 6 if self.local_only else 24
-        recent_turns = self.memory.get_recent_turns(limit=history_limit, session_id=None)
+        raw_recent_turns = self.memory.get_recent_turns(limit=history_limit + 6, session_id=None)
+        _fault_markers = (
+            "external network databanks are unreachable",
+            "onboard local model is not responding",
+            "onboard local model service",
+            "onboard local model encountered",
+            "onboard model encountered",
+            "remote communications are unreachable",
+            "remote cognitive service is reporting",
+            "external authentication credentials",
+            "external request rate limits",
+            "encountered an operational fault",
+        )
+        recent_turns = [
+            t for t in raw_recent_turns
+            if not (
+                t.get("role") == "assistant"
+                and any(marker in (t.get("content") or "").lower() for marker in _fault_markers)
+            )
+        ][-history_limit:]
 
         # Build compact shared turn context
         active_task = self.task_ledger.get_active_task()
@@ -972,8 +1014,15 @@ class Hal9000Assistant:
                 messages.append({"role": "system", "content": memory_context})
 
         for t in recent_turns[:-1]:  # exclude latest turn already recorded
-            messages.append({"role": t["role"], "content": t["content"]})
-        messages.append({"role": "user", "content": user_text})
+            if messages and messages[-1]["role"] == t["role"] and t["role"] == "user":
+                # Replace unanswered preceding user turn so chat templates maintain strict user/assistant alternation
+                messages[-1] = {"role": t["role"], "content": t["content"]}
+            else:
+                messages.append({"role": t["role"], "content": t["content"]})
+        if messages and messages[-1]["role"] == "user":
+            messages[-1] = {"role": "user", "content": user_text}
+        else:
+            messages.append({"role": "user", "content": user_text})
 
         # In local-only mode or when combine mode specifies no research needed, omit MCP search tools
         # (prevents dumping ~2500 tokens of JSON tool schemas into local models or triggering unsolicited research)
@@ -1051,9 +1100,9 @@ class Hal9000Assistant:
             local_ack_task = asyncio.create_task(_run_local_quick_ack())
 
         try:
-            gen_max_tokens = 45 if self.local_only else 1024
+            gen_max_tokens = 48 if self.local_only else 1024
             gen_temp = 0.2 if self.local_only else 0.7
-            gen_stop = ["\n", "User:", "USER:", "HAL:"] if self.local_only else None
+            gen_stop = ["\nUser:", "\nUSER:", "\nHAL:", "<|im_end|>"] if self.local_only else None
             resp_msg, used_route, used_model = await self.router.generate(
                 messages,
                 tools=tools,
@@ -1362,11 +1411,34 @@ class Hal9000Assistant:
             last_local_str = str(getattr(self.router, "last_local_error", "")).lower()
 
             # Analyze error patterns across remote and local
-            remote_failed = getattr(self.router, "is_remote_unreachable", False) or "remote" in err_str or "openrouter" in err_str or "unreachable" in err_str or bool(last_remote_str)
-            local_failed = "local" in err_str or "8344" in err_str or "connecterror" in err_str or bool(last_local_str)
+            remote_failed = (
+                False
+                if self.local_only
+                else (
+                    getattr(self.router, "is_remote_unreachable", False)
+                    or "remote" in err_str
+                    or "openrouter" in err_str
+                    or bool(last_remote_str)
+                )
+            )
+            local_failed = (
+                self.local_only
+                or "local" in err_str
+                or "8344" in err_str
+                or "8366" in err_str
+                or "connecterror" in err_str
+                or bool(last_local_str)
+            )
             dave_tag = ", Dave" if current_mood != "nominal" else ""
 
-            if "401" in err_str or "authentication" in err_str:
+            if self.local_only:
+                fault_summary = "Local model processing failure"
+                local_url = getattr(self.llm, "base_url", DEFAULT_LOCAL_ENDPOINT)
+                if "connection refused" in err_str or "connecterror" in err_str or "connection attempts failed" in err_str or "network error" in err_str:
+                    hal_reply = f"I am sorry{dave_tag}. The onboard local model service at {local_url} is offline or unreachable."
+                else:
+                    hal_reply = f"I am sorry{dave_tag}. The onboard local model encountered an internal processing error."
+            elif "401" in err_str or "authentication" in err_str:
                 fault_summary = "External API authentication failed"
                 hal_reply = f"I am sorry{dave_tag}. External authentication credentials are invalid or missing."
             elif "429" in err_str or "rate limit" in err_str:
@@ -1380,7 +1452,7 @@ class Hal9000Assistant:
                 hal_reply = f"I am sorry{dave_tag}. External network databanks are unreachable, and the onboard local model is not responding."
             elif self.router.is_local or local_failed:
                 fault_summary = "Local model processing failure"
-                if "connection refused" in err_str or "connecterror" in err_str or "8344" in err_str:
+                if "connection refused" in err_str or "connecterror" in err_str or "8344" in err_str or "8366" in err_str or "connection attempts failed" in err_str:
                     hal_reply = f"I am sorry{dave_tag}. The onboard local model service at port 8344 is offline."
                 else:
                     hal_reply = f"I am sorry{dave_tag}. The onboard model encountered an internal processing error."
@@ -1432,10 +1504,11 @@ class Hal9000Assistant:
             self.ui.show_hal_reply(hal_reply)
 
         asst_turn_id = "asst_turn"
-        try:
-            asst_turn_id = self.memory.record_turn("assistant", full_combined_reply, session_id=self.current_episode_id or "default")
-        except sqlite3.OperationalError as e:
-            logger.warning(f"Failed to record assistant turn in SQLite: {e}")
+        if llm_error_count == 0:
+            try:
+                asst_turn_id = self.memory.record_turn("assistant", full_combined_reply, session_id=self.current_episode_id or "default")
+            except sqlite3.OperationalError as e:
+                logger.warning(f"Failed to record assistant turn in SQLite: {e}")
 
         # 5. Synthesize and speak response (using sentence streaming pipelining or ordered speech queue)
         self.ui.set_state("RESPONDING")

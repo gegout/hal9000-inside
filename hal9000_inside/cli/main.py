@@ -261,14 +261,17 @@ def cmd_run(args):
     combine_mode = bool(getattr(args, "combine", False) or cfg.get("cli", {}).get("combine", False))
 
     if combine_mode:
-        from hal9000_inside.smollm2 import check_smollm2_snap_installed, sync_verify_smollm2_endpoint, get_smollm2_install_instruction
-        if not check_smollm2_snap_installed():
-            print("\n" + get_smollm2_install_instruction() + "\n")
-            # Do not exit; provide clear explanation and proceed or check if running elsewhere
-        ready, err = sync_verify_smollm2_endpoint()
+        from hal9000_inside.smollm2 import (
+            check_smollm2_snap_installed,
+            sync_discover_local_llm_endpoint,
+            get_smollm2_install_instruction,
+        )
+        disc_ep, disc_mod, ready = sync_discover_local_llm_endpoint()
         if not ready:
-            print(f"[NOTE] SmolLM2 endpoint is not responding at http://127.0.0.1:8344/v1 ({err}).")
-            print("HAL will operate using remote model until local SmolLM2 service is available.")
+            if not check_smollm2_snap_installed():
+                print("\n" + get_smollm2_install_instruction() + "\n")
+            print(f"[NOTE] Local model endpoint is not responding at {disc_ep}.")
+            print("HAL will operate using remote model until local model service is available.")
 
     assistant = Hal9000Assistant(
         capture_device=args.device,
@@ -368,17 +371,23 @@ def cmd_runlocal(args):
     cfg_runlocal = cfg.get("cli", {}).get("runlocal", {})
     cfg_llm = cfg.get("engine", {}).get("llm", {})
 
-    endpoint = (
-        getattr(args, "endpoint", None)
-        or cfg_runlocal.get("endpoint")
-        or cfg_llm.get("local_base_url", DEFAULT_LOCAL_ENDPOINT)
-    )
-    model = (
-        getattr(args, "model", None)
-        or cfg_runlocal.get("model")
-        or cfg_llm.get("local_model", DEFAULT_LOCAL_MODEL)
-    )
+    explicit_endpoint = getattr(args, "endpoint", None) or cfg_runlocal.get("endpoint")
+    explicit_model = getattr(args, "model", None) or cfg_runlocal.get("model")
+    endpoint = explicit_endpoint or cfg_llm.get("local_base_url", DEFAULT_LOCAL_ENDPOINT)
+    model = explicit_model or cfg_llm.get("local_model", DEFAULT_LOCAL_MODEL)
     system_prompt_path = getattr(args, "system_prompt", None)
+
+    from hal9000_inside.smollm2 import sync_discover_local_llm_endpoint
+    disc_ep, disc_mod, disc_ok = sync_discover_local_llm_endpoint(
+        preferred_endpoint=endpoint,
+        preferred_model=model,
+        timeout_seconds=1.2,
+        allow_fallback_ports=not bool(explicit_endpoint),
+    )
+    if disc_ok:
+        endpoint = disc_ep
+        if not explicit_model:
+            model = disc_mod
 
     try:
         assistant = Hal9000Assistant(

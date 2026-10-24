@@ -315,8 +315,8 @@ class LLMRouter:
             except Exception as le:
                 self.last_local_error = le
                 self.local_backoff_until = time.time() + 60.0
-                logger.warning(f"Local LLM execution failed ({le}). Trying remote backup if available.")
                 if self.remote_client and self.remote_client.is_configured:
+                    logger.warning(f"Local LLM execution failed ({le}). Trying remote backup if available.")
                     t0 = time.perf_counter()
                     try:
                         res = await self.remote_client.generate_response(
@@ -328,6 +328,7 @@ class LLMRouter:
                     except Exception as re:
                         self.last_remote_error = re
                         raise
+                logger.warning(f"Local LLM execution failed ({le}).")
                 raise
         elif self.remote_client:
             t0 = time.perf_counter()

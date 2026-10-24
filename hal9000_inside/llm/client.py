@@ -278,7 +278,11 @@ class LLMClient:
                 payload["tool_choice"] = tool_choice
         if reasoning is not None:
             payload["reasoning"] = reasoning
-        elif not self.is_local:
+        elif self.is_local:
+            # Disable extended thinking (<think>...</think> / reasoning_content) on local llama-server / smollm3 / qwen3
+            # so token budget is spent on direct spoken output rather than reasoning_content
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        else:
             # Default to turning off extended thinking tokens so max_tokens budget is entirely dedicated to generation
             payload["reasoning"] = {"effort": "none"}
         if provider is not None:
@@ -302,6 +306,8 @@ class LLMClient:
                         continue
                     if resp.status_code >= 500:
                         if attempt == self.max_retries:
+                            if self.is_local:
+                                raise LocalModelExecutionError(f"{prefix} Server error: HTTP {resp.status_code}", status_code=resp.status_code)
                             raise RemoteUnreachableError(f"{prefix} Server error: HTTP {resp.status_code}", status_code=resp.status_code)
                         await asyncio.sleep(0.5 * attempt)
                         continue
@@ -316,16 +322,40 @@ class LLMClient:
                         raise RuntimeError(f"{prefix} request failed (HTTP {resp.status_code}): {err_text}")
                     data = resp.json()
                     msg = data["choices"][0]["message"]
+                    if isinstance(msg, dict) and msg.get("content"):
+                        cleaned_content = re.sub(r"<think>.*?</think>", "", str(msg["content"]), flags=re.DOTALL).strip()
+                        msg["content"] = cleaned_content
                     if return_dict or tools:
                         return msg
                     return (msg.get("content") or "").strip()
                 except (httpx.ConnectError, httpx.TimeoutException) as e:
                     prefix = "Local LLM" if self.is_local else "OpenRouter"
+                    # If local endpoint failed to connect on attempt 1 and no custom transport is used,
+                    # check if an alternate local LLM port (e.g. smollm3 on 8366 vs smollm2 on 8344) is active
+                    if self.is_local and self.transport is None and attempt == 1:
+                        try:
+                            from hal9000_inside.smollm2 import discover_local_llm_endpoint
+                            disc_ep, disc_model, ok = await discover_local_llm_endpoint(
+                                preferred_endpoint=self.base_url,
+                                preferred_model=str(payload.get("model") or self.model),
+                            )
+                            if ok and disc_ep != self.base_url:
+                                logger.info(f"Auto-discovered active local LLM at {disc_ep} (model: {disc_model}), switching from {self.base_url}.")
+                                self.base_url = disc_ep
+                                self.model = disc_model
+                                payload["model"] = disc_model
+                                continue
+                        except Exception:
+                            pass
                     if attempt == self.max_retries:
+                        if self.is_local:
+                            raise LocalModelExecutionError(f"Network error communicating with {prefix} ({self.base_url}): {e}", cause=e)
                         raise RemoteUnreachableError(f"Network error communicating with {prefix}: {e}", cause=e)
                     await asyncio.sleep(0.5 * attempt)
 
         prefix = "Local LLM" if self.is_local else "OpenRouter"
+        if self.is_local:
+            raise LocalModelExecutionError(f"{prefix} completion failed after max retries.")
         raise RemoteUnreachableError(f"{prefix} completion failed after max retries.")
 
     async def stream_response(
