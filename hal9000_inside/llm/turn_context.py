@@ -291,6 +291,59 @@ def find_grounded_answer(
                 answer = "Yes, you said you're there for the week."
                 return evidence, answer
 
+    # Question about what is currently stored in HAL's memory / what HAL remembers
+    if re.search(
+        r"\b(what is in your memory|what do you have in your memory|what you have in your memory|what's in your memory|what is stored in your memory|what do you remember|what memories do you have|check your memory)\b",
+        clean,
+    ):
+        useful_mems = []
+        for m in confirmed_memories:
+            cat = (m.get("category") or "").lower()
+            prov = (m.get("provenance") or "").lower()
+            txt = (m.get("text") or "").strip()
+            if not txt or cat in ("curiosity", "system_status", "user_response") or prov in ("web", "remote_model", "curiosity", "assistant"):
+                continue
+            if txt.startswith("Discovery regarding"):
+                continue
+            if len(txt) > 140:
+                txt = txt[:137].rstrip() + "..."
+            useful_mems.append(txt)
+        if not useful_mems:
+            for m in confirmed_memories:
+                cat = (m.get("category") or "").lower()
+                prov = (m.get("provenance") or "").lower()
+                txt = (m.get("text") or "").strip()
+                if not txt or cat in ("curiosity", "system_status") or prov == "web" or txt.startswith("Discovery regarding"):
+                    continue
+                if len(txt) > 140:
+                    txt = txt[:137].rstrip() + "..."
+                useful_mems.append(txt)
+        if useful_mems:
+            cleaned_items = []
+            seen_prefixes = set()
+            for item in useful_mems:
+                # Avoid near-duplicate entries sharing the same 35-char prefix
+                prefix = re.sub(r"\W+", "", item.lower())[:35]
+                if prefix in seen_prefixes:
+                    continue
+                seen_prefixes.add(prefix)
+                cleaned_items.append(item.rstrip(". "))
+                if len(cleaned_items) >= 3:
+                    break
+            top_items = "; ".join(cleaned_items)
+            evidence = f"Confirmed stored memories ({len(useful_mems)} items): {top_items}"
+            answer = f"In my memory records, I have noted: {top_items}."
+            return evidence, answer
+        elif confirmed_memories:
+            txt = (confirmed_memories[0].get("text") or "").strip()[:120]
+            evidence = f"Stored memory: {txt}"
+            answer = f"My current memory records include: {txt}."
+            return evidence, answer
+        else:
+            evidence = "Memory store currently contains no confirmed user facts."
+            answer = "My memory records do not currently contain any stored personal facts for this session."
+            return evidence, answer
+
     # Question about current machine time, date, or timezone
     if re.search(r"\b(what time is it|current time|time of the machine|check the time|what is the time|what day is it|what is today's date|what date is it|which time\s*zone are you|what time\s*zone are you)\b", clean):
         now_local = datetime.datetime.now().astimezone()

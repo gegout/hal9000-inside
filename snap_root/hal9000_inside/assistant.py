@@ -122,11 +122,15 @@ class Hal9000Assistant:
         )
         if system_prompt is not None:
             self.system_prompt = system_prompt.strip() or HAL9000_SYSTEM_PROMPT
-        else:
+        elif self.local_only or system_prompt_path is not None:
             self.system_prompt = load_system_prompt(
                 self.system_prompt_path,
                 strict=bool(system_prompt_path is not None),
             )
+        else:
+            # In remote or combine mode without an explicit --system-prompt override,
+            # use the full HAL9000_SYSTEM_PROMPT with mood dynamics and tool instructions.
+            self.system_prompt = HAL9000_SYSTEM_PROMPT
 
         # Compute device configuration
         eff_nvidia = use_nvidia if use_nvidia is not None else cfg_cli.get("enable_nvidia", None)
@@ -237,8 +241,8 @@ class Hal9000Assistant:
             notify_stop_fn=lambda: self.audio_ctrl.notify_playback_stopped(),
         )
         self.smollm2_quick = SmolLM2QuickResponder(
-            endpoint=cfg_llm.get("local_base_url", "http://127.0.0.1:8344/v1"),
-            model=cfg_llm.get("local_model", "smollm2-135m"),
+            endpoint=local_base,
+            model=local_model,
             timeout_seconds=2.0,
             max_words=self.local_word_limit,
         )
@@ -402,15 +406,25 @@ class Hal9000Assistant:
         if not caps:
             self.ui.show_warning("No ALSA capture devices detected. Check microphone connection.")
 
-        # Step 6: MCP Servers & Tools
-        self.ui.show_progress(6, total_steps, "Connecting to configured MCP servers...")
-        try:
-            await self.mcp.connect_all()
-            mcp_tools = self.mcp.get_openai_tools()
-            if mcp_tools:
-                logger.info(f"Loaded {len(mcp_tools)} MCP tools for HAL 9000")
-        except Exception as e:
-            self.ui.show_warning(f"Could not connect to some MCP servers: {e}")
+        # Step 6: MCP Servers & Tools (and E5 memory embedder preload)
+        embedder_obj = getattr(self.memory, "embedder", None)
+        if embedder_obj is not None and hasattr(embedder_obj, "load") and not getattr(embedder_obj, "_session", None):
+            try:
+                embedder_obj.load()
+            except Exception as ee:
+                logger.debug(f"Could not preload E5 embedder during initialize: {ee}")
+
+        if self.local_only:
+            self.ui.show_progress(6, total_steps, "Local-only mode active (external MCP tools disabled)...")
+        else:
+            self.ui.show_progress(6, total_steps, "Connecting to configured MCP servers...")
+            try:
+                await self.mcp.connect_all()
+                mcp_tools = self.mcp.get_openai_tools()
+                if mcp_tools:
+                    logger.info(f"Loaded {len(mcp_tools)} MCP tools for HAL 9000")
+            except Exception as e:
+                self.ui.show_warning(f"Could not connect to some MCP servers: {e}")
 
         # Step 7: Complete
         self.ui.show_progress(7, total_steps, "All subsystems operational.")
@@ -773,13 +787,63 @@ class Hal9000Assistant:
         # 3. Retrieve relevant conversational memory context and build shared turn context
         t_ret_start = time.perf_counter()
         memories = self.memory.search(user_text, limit=4)
+        # If the user is asking what is in HAL's memory, also inspect stored memories directly
+        # so meta-memory queries don't miss facts due to semantic query phrasing
+        if re.search(
+            r"\b(what is in your memory|what do you have in your memory|what you have in your memory|what's in your memory|what do you remember|what is stored in your memory|what memories do you have|check your memory)\b",
+            user_text.lower(),
+        ) and hasattr(self.memory, "inspect_all"):
+            try:
+                all_mems = self.memory.inspect_all()
+                seen_ids = {m.get("id") for m in memories if m.get("id")}
+                # Prioritize explicit user facts (provenance == 'user' or category in ('user_profile', 'preference', 'knowledge', 'user_context'))
+                # over assistant-generated turn digests or background curiosity scrapes
+                primary_user_facts = [
+                    m for m in all_mems
+                    if (m.get("provenance") or "").lower() == "user"
+                    and (m.get("category") or "").lower() in ("user_profile", "preference", "knowledge", "user_context")
+                    and not (m.get("text") or "").startswith("Discovery regarding")
+                ]
+                secondary_facts = [
+                    m for m in all_mems
+                    if m not in primary_user_facts
+                    and (m.get("category") or "").lower() not in ("curiosity", "system_status", "user_response")
+                    and (m.get("provenance") or "").lower() not in ("web", "remote_model", "curiosity", "assistant")
+                    and not (m.get("text") or "").startswith("Discovery regarding")
+                ]
+                ordered_facts = primary_user_facts + secondary_facts
+                for m in reversed(ordered_facts):
+                    if m.get("id") not in seen_ids:
+                        memories.insert(0, m)
+                        seen_ids.add(m.get("id"))
+                    else:
+                        # Move to front so primary user facts precede noisy semantic matches
+                        memories = [m] + [x for x in memories if x.get("id") != m.get("id")]
+            except Exception as ie:
+                logger.debug(f"Memory inspect_all fallback error: {ie}")
         retrieval_ms = (time.perf_counter() - t_ret_start) * 1000.0
 
         memory_context = ""
         if memories:
-            memory_context = "Relevant memories and context:\n" + "\n".join(f"- {m['text']}" for m in memories)
+            if self.local_only:
+                # Filter out massive raw Wikipedia curiosity JSON scrapes for compact local models
+                compact_lines = []
+                for m in memories:
+                    txt = (m.get("text") or "").strip()
+                    if not txt or txt.startswith("Discovery regarding"):
+                        continue
+                    if len(txt) > 160:
+                        txt = txt[:157].rstrip() + "..."
+                    compact_lines.append(f"- {txt}")
+                    if len(compact_lines) >= 4:
+                        break
+                if compact_lines:
+                    memory_context = "Relevant memories:\n" + "\n".join(compact_lines)
+            else:
+                memory_context = "Relevant memories and context:\n" + "\n".join(f"- {m['text']}" for m in memories)
 
-        recent_turns = self.memory.get_recent_turns(limit=24, session_id=None)
+        history_limit = 6 if self.local_only else 24
+        recent_turns = self.memory.get_recent_turns(limit=history_limit, session_id=None)
 
         # Build compact shared turn context
         active_task = self.task_ledger.get_active_task()
@@ -792,7 +856,7 @@ class Hal9000Assistant:
         )
 
         current_task = None
-        if turn_context.needs_research:
+        if turn_context.needs_research and not self.local_only:
             current_task = self.task_ledger.create_task(
                 originating_turn_id=user_turn_id,
                 originating_request=user_text,
@@ -800,8 +864,47 @@ class Hal9000Assistant:
                 required_tools=["web_search_wikipedia", "knowledge_search"],
             )
 
-        # In combine mode, if turn context can be finished locally (e.g. sharing info, simple correction, or social)
-        if self.combine_mode and not turn_context.needs_remote:
+        # In local_only mode, if turn_context has a direct authoritative grounded answer
+        # (e.g. clock/time/timezone, memory inspection, or personal recollection), deliver it immediately
+        if self.local_only and turn_context.direct_local_answer:
+            direct_ans = turn_context.direct_local_answer.strip()
+            self.recent_openings.append(direct_ans)
+            self.ui.show_hal_reply(direct_ans)
+            self.audio_ctrl.notify_playback_started()
+            t_tts_direct = time.perf_counter()
+            try:
+                if hasattr(self.tts, "speak_sentences"):
+                    await self.tts.speak_sentences(
+                        direct_ans,
+                        on_audio_chunk=lambda c: self.playback.play_pcm(c) if not self._cancel_current and not self.is_sleeping else None,
+                    )
+                else:
+                    loop = asyncio.get_running_loop()
+                    pcm = await loop.run_in_executor(None, self.tts.synthesize_raw_pcm, direct_ans)
+                    if not self._cancel_current and not self.is_sleeping:
+                        await loop.run_in_executor(None, self.playback.play_pcm, pcm)
+            finally:
+                self.audio_ctrl.notify_playback_stopped()
+            tts_direct_ms = (time.perf_counter() - t_tts_direct) * 1000.0
+            try:
+                self.memory.record_turn("assistant", direct_ans, session_id=self.current_episode_id or "default")
+            except Exception as me:
+                logger.warning(f"Failed to record local grounded turn: {me}")
+            log_dialogue_turn(
+                speaker="HAL 9000",
+                text=direct_ans,
+                mood="nominal",
+                route="local",
+                model=getattr(self.router, "model", "local"),
+                latency_ms=retrieval_ms,
+                tts_ms=tts_direct_ms,
+                status="nominal",
+                fluidity_notes="fluid",
+            )
+            return
+
+        # In combine or local_only mode, if turn context can be finished locally (e.g. sharing info, simple correction, or social)
+        if (self.combine_mode or self.local_only) and not turn_context.needs_remote:
             local_reply = await self.smollm2_quick.generate_opening(turn_context)
             if local_reply:
                 valid_local = validate_local_response(local_reply, max_words=self.local_word_limit, user_utterance=user_text)
@@ -844,7 +947,7 @@ class Hal9000Assistant:
         # Format interoceptive self-state block (<60 tokens)
         route_name = "remote" if not self.router.is_local else "local"
         gpu_avail = bool(self.compute_config.enable_nvidia and self.compute_config.has_cuda)
-        is_conn = bool(not getattr(self.router, "is_remote_unreachable", False) and getattr(self.router.connectivity, "is_connected", True))
+        is_conn = True if self.local_only else bool(not getattr(self.router, "is_remote_unreachable", False) and getattr(self.router.connectivity, "is_connected", True))
         self_state_block = self.interoception.format_self_state_prompt(
             route=route_name,
             model_id=self.router.model,
@@ -854,18 +957,27 @@ class Hal9000Assistant:
         )
 
         # 4. Prompt OpenRouter/Local LLM with MCP tools and self-state block
-        messages = [
-            {"role": "system", "content": f"{self.system_prompt}\n\n{self_state_block}"}
-        ]
-        if memory_context:
-            messages.append({"role": "system", "content": memory_context})
+        if self.local_only:
+            # In local-only mode, keep the system prompt clean and compact without verbose telemetry headers
+            # so small local models (like smollm2-135m) evaluate the prompt quickly and do not echo telemetry.
+            sys_content = self.system_prompt
+            if memory_context:
+                sys_content = f"{sys_content}\n\n{memory_context}"
+            messages = [{"role": "system", "content": sys_content}]
+        else:
+            messages = [
+                {"role": "system", "content": f"{self.system_prompt}\n\n{self_state_block}"}
+            ]
+            if memory_context:
+                messages.append({"role": "system", "content": memory_context})
 
         for t in recent_turns[:-1]:  # exclude latest turn already recorded
             messages.append({"role": t["role"], "content": t["content"]})
         messages.append({"role": "user", "content": user_text})
 
-        # When combine mode specifies no research needed, omit MCP search tools to prevent unsolicited encyclopedia research
-        if self.combine_mode and not turn_context.needs_research:
+        # In local-only mode or when combine mode specifies no research needed, omit MCP search tools
+        # (prevents dumping ~2500 tokens of JSON tool schemas into local models or triggering unsolicited research)
+        if self.local_only or (self.combine_mode and not turn_context.needs_research):
             tools = None
         else:
             tools = self.mcp.get_openai_tools() or None
@@ -939,11 +1051,16 @@ class Hal9000Assistant:
             local_ack_task = asyncio.create_task(_run_local_quick_ack())
 
         try:
+            gen_max_tokens = 45 if self.local_only else 1024
+            gen_temp = 0.2 if self.local_only else 0.7
+            gen_stop = ["\n", "User:", "USER:", "HAL:"] if self.local_only else None
             resp_msg, used_route, used_model = await self.router.generate(
                 messages,
                 tools=tools,
                 return_dict=True,
-                max_tokens=1024,
+                max_tokens=gen_max_tokens,
+                temperature=gen_temp,
+                stop=gen_stop,
                 on_fallback=(lambda err: _speak_fallback_ack(err)) if not self.combine_mode else None,
             )
             self.speech_queue.mark_remote_ready()
@@ -1194,6 +1311,17 @@ class Hal9000Assistant:
             # Strip any leaked [System State: ...] prompt header from model output
             hal_reply = re.sub(r'^\s*\[System State:[^\]]*\]\s*', '', hal_reply, flags=re.DOTALL).strip()
 
+            # In local_only mode, clean up trailing incomplete sentence fragments or dangling colons
+            if self.local_only and hal_reply:
+                hal_reply = re.sub(r"[\s:,\-]+$", "", hal_reply).strip()
+                if hal_reply and hal_reply[-1] not in ".!?":
+                    # Retain complete sentences if at least one ended with punctuation; otherwise append period
+                    m_sent = re.match(r"^(.+[.!?])\s+[^.!?]+$", hal_reply)
+                    if m_sent and len(m_sent.group(1).strip()) >= 12:
+                        hal_reply = m_sent.group(1).strip()
+                    else:
+                        hal_reply = hal_reply + "."
+
             # Ensure that in nominal mood, HAL NEVER addresses the user as Dave
             if current_mood == "nominal":
                 hal_reply = re.sub(r'\bDave,\s*', '', hal_reply, flags=re.IGNORECASE)
@@ -1275,7 +1403,7 @@ class Hal9000Assistant:
         self.last_latency_ms = llm_ms
 
         # Re-verify interoceptive mood with final turn latency and errors
-        is_conn = bool(not getattr(self.router, "is_remote_unreachable", False) and getattr(self.router.connectivity, "is_connected", True))
+        is_conn = True if self.local_only else bool(not getattr(self.router, "is_remote_unreachable", False) and getattr(self.router.connectivity, "is_connected", True))
         current_mood = self.interoception.compute_mood(
             route=used_route,
             connected=is_conn,
@@ -1406,6 +1534,11 @@ class Hal9000Assistant:
 
     def _enqueue_post_turn_cognition(self, user_text: str, hal_reply: str):
         """Enqueue non-blocking turn digest and autonomous cognitive routines."""
+        if self.local_only:
+            # In local-only mode, skip background LLM TurnDigestAnalyzer and CuriosityEngine jobs
+            # so they never saturate the single-threaded local model server between user turns.
+            return
+
         async def _run_digest():
             res = await self.digest_analyzer.analyze_turn(user_text, hal_reply)
             if not res:

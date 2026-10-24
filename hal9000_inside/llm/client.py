@@ -244,6 +244,7 @@ class LLMClient:
         model: Optional[str] = None,
         reasoning: Optional[Dict[str, Any]] = None,
         provider: Optional[Dict[str, Any]] = None,
+        stop: Optional[List[str]] = None,
     ) -> Any:
         """Non-streaming completion with optional tools, retries and timeout.
         
@@ -269,6 +270,8 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if stop:
+            payload["stop"] = stop
         if tools:
             payload["tools"] = tools
             if tool_choice:

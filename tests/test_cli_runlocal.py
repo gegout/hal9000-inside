@@ -131,3 +131,75 @@ def test_cli_runlocal_missing_prompt_file_returns_error(tmp_path):
         with pytest.raises(SystemExit) as exc_info:
             main()
         assert exc_info.value.code == 1
+
+
+def test_runlocal_low_latency_no_tools_or_post_turn_digest():
+    """Verify local_only mode omits MCP tools, skips post-turn LLM digest, and answers memory queries directly."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    mock_mem = MagicMock()
+    mock_mem.search.return_value = [
+        {
+            "id": "m1",
+            "category": "curiosity",
+            "provenance": "web",
+            "text": "Discovery regarding 'What are the latest developments?' " + ("x" * 2000),
+        }
+    ]
+    mock_mem.inspect_all.return_value = [
+        {
+            "id": "u1",
+            "category": "user_profile",
+            "provenance": "user",
+            "text": "The user's name is Cedric Jegout, VP of Product at Canonical.",
+        }
+    ]
+    mock_mem.get_recent_turns.return_value = []
+    mock_mem.record_turn.return_value = "turn-1"
+
+    mock_tts = MagicMock()
+    mock_tts.speak_sentences = AsyncMock(return_value=None)
+    mock_adapter = MagicMock()
+    mock_sink = MagicMock()
+
+    assistant = Hal9000Assistant(
+        local_only=True,
+        endpoint_override="http://127.0.0.1:8344/v1",
+        model_override="smollm2-135m",
+        memory=mock_mem,
+        tts=mock_tts,
+        adapter=mock_adapter,
+        audio_sink=mock_sink,
+    )
+    assistant.mcp.get_openai_tools = MagicMock(return_value=[{"type": "function", "function": {"name": "heavy_tool"}}])
+    assistant.router.generate = AsyncMock(return_value=({"role": "assistant", "content": "One plus one equals 2."}, "local", "smollm2-135m"))
+    assistant.digest_analyzer.analyze_turn = AsyncMock()
+
+    async def _run():
+        # 1. Grounded memory inspection query should be answered directly without calling router.generate
+        assistant._transcribe = AsyncMock(return_value="Al, what is in your memory now?")
+        await assistant._handle_turn(b"\x00" * 3200)
+        assert assistant.router.generate.call_count == 0
+        recorded_reply = mock_mem.record_turn.call_args_list[-1][0][1]
+        assert "Cedric Jegout" in recorded_reply
+        assert "Discovery regarding" not in recorded_reply
+
+        # 2. General question should call router.generate with tools=None, max_tokens=45, and no post-turn digest
+        assistant._transcribe = AsyncMock(return_value="One plus one equals what?")
+        await assistant._handle_turn(b"\x00" * 3200)
+        assert assistant.router.generate.call_count == 1
+        call_kwargs = assistant.router.generate.call_args.kwargs
+        assert call_kwargs["tools"] is None
+        assert call_kwargs["max_tokens"] == 45
+        assert call_kwargs["temperature"] == 0.2
+        assert call_kwargs["stop"] == ["\n", "User:", "USER:", "HAL:"]
+        # Verify curiosity scrape was filtered out of system message
+        messages_sent = assistant.router.generate.call_args.args[0]
+        assert "Discovery regarding" not in messages_sent[0]["content"]
+        assert "[System State:" not in messages_sent[0]["content"]
+        # Post-turn cognition must be skipped in local_only mode
+        assert assistant.digest_analyzer.analyze_turn.call_count == 0
+
+    asyncio.run(_run())
+

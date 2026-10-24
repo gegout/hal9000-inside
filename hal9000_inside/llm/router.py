@@ -175,6 +175,8 @@ class LLMRouter:
         tools: Optional[List[Dict[str, Any]]] = None,
         return_dict: bool = False,
         max_tokens: int = 1024,
+        temperature: float = 0.7,
+        stop: Optional[List[str]] = None,
         on_fallback: Optional[Any] = None,
     ) -> tuple[Any, str, str]:
         """Generate response with routing, deadline, and fallback.
@@ -294,9 +296,21 @@ class LLMRouter:
         # Direct local route execution
         if self.local_client:
             try:
-                res = await self.local_client.generate_response(
-                    messages, tools=tools, return_dict=return_dict, max_tokens=max_tokens
-                )
+                loc_kwargs: Dict[str, Any] = {
+                    "tools": tools,
+                    "return_dict": return_dict,
+                    "max_tokens": max_tokens,
+                }
+                if temperature != 0.7:
+                    loc_kwargs["temperature"] = temperature
+                if stop is not None:
+                    loc_kwargs["stop"] = stop
+                try:
+                    res = await self.local_client.generate_response(messages, **loc_kwargs)
+                except TypeError:
+                    res = await self.local_client.generate_response(
+                        messages, tools=tools, return_dict=return_dict, max_tokens=max_tokens
+                    )
                 return res, "local", self.local_client.model
             except Exception as le:
                 self.last_local_error = le
